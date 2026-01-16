@@ -120,6 +120,52 @@ class Engine:
         with self._lock:
             return self._mode
 
+    def snapshot(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "mapping_enabled": self._mapping_enabled,
+                "camera_lock": self._camera_lock,
+                "backpack_open": self._backpack_open,
+                "target_active": self._target_active,
+                "mode": self._mode.value,
+            }
+
+    def set_mapping_enabled(self, enabled: bool) -> None:
+        with self._lock:
+            self._mapping_enabled = bool(enabled)
+            if not self._mapping_enabled:
+                self._camera_lock = False
+                self._backpack_open = False
+        if not enabled:
+            self._safe_release_all()
+
+    def panic(self) -> None:
+        with self._lock:
+            self._mapping_enabled = False
+            self._camera_lock = False
+            self._backpack_open = False
+        self._safe_release_all()
+
+    def set_camera_lock(self, enabled: bool) -> None:
+        with self._lock:
+            self._camera_lock = bool(enabled)
+            if self._camera_lock:
+                self._backpack_open = False
+
+    def toggle_backpack(self) -> None:
+        with self._lock:
+            opening = not self._backpack_open
+            self._backpack_open = opening
+            self._camera_lock = False if opening else True
+            self._tap_queue.append(
+                TapRequest(
+                    name="backpack",
+                    point=self._profile.points["I"],
+                    hold_ms=self._profile.fire.tapHoldMs,
+                    rrand_px=self._cfg.global_.rrandDefaultPx,
+                )
+            )
+
     # -------------------------
     # EventTap callback
     # -------------------------
@@ -349,40 +395,47 @@ class Engine:
     def _tick_free(self, now: float) -> None:
         # 自由鼠标态：不做任何坐标映射，除滚轮映射外。
         with self._lock:
-            wheel = self._wheel
-            pending_steps = wheel.pending_steps
-            last_ts = wheel.last_wheel_ts
-            active = wheel.active
+            active = self._wheel.active
+            pending_steps = self._wheel.pending_steps
+            last_ts = self._wheel.last_wheel_ts
+            cursor_origin = self._wheel.cursor_origin
+            touch_pos = self._wheel.touch_pos
 
         if not active:
             self._safe_release_all()
             return
 
         # 首次 tick：确定落点并按下
-        if wheel.touch_pos is None:
-            origin = wheel.cursor_origin or self._inj.get_cursor_pos()
+        if touch_pos is None:
+            origin = cursor_origin or self._inj.get_cursor_pos()
             r = self._profile.wheel.rrandPx
             if r is None:
                 r = self._cfg.global_.rrandDefaultPx
             p0 = random_point(origin, float(r or 0.0), rng=self._rng)
-            wheel.touch_pos = p0
             try:
                 self._inj.left_down(p0)
             except Exception as e:
                 self._log.debug("wheel down failed: %s", e)
-                self._wheel = WheelSession()  # reset
+                with self._lock:
+                    self._wheel = WheelSession()  # reset
                 return
+            with self._lock:
+                # 若期间被重置，则不强行覆盖
+                if self._wheel.active and self._wheel.touch_pos is None:
+                    self._wheel.touch_pos = p0
+                    touch_pos = p0
 
         # 判断停止
         stop_s = max(0.01, self._profile.wheel.stopMs / 1000.0)
         if now - last_ts > stop_s:
             try:
-                self._inj.left_up(wheel.touch_pos)
+                up_pos = touch_pos or self._inj.get_cursor_pos()
+                self._inj.left_up(up_pos)
             except Exception:
                 pass
-            if wheel.cursor_origin is not None:
+            if cursor_origin is not None:
                 try:
-                    self._inj.warp(wheel.cursor_origin)
+                    self._inj.warp(cursor_origin)
                 except Exception:
                     pass
             with self._lock:
@@ -397,11 +450,15 @@ class Engine:
         with self._lock:
             self._wheel.pending_steps -= step
 
-        cur = wheel.touch_pos
+        cur = touch_pos
+        if cur is None:
+            return
         target = (cur[0], cur[1] + step * float(self._profile.wheel.dPx))
         try:
             self._inj.drag_smooth(cur, target, max_step_px=self._profile.scheduler.maxStepPx)
-            wheel.touch_pos = target
+            with self._lock:
+                if self._wheel.active:
+                    self._wheel.touch_pos = target
         except Exception:
             # 出错则重置，避免卡住
             self._safe_release_all()
@@ -538,4 +595,3 @@ class Engine:
             self._inj.release_all()
         except Exception:
             pass
-

@@ -48,6 +48,22 @@ mirroring-keymap pick
 mirroring-keymap --config config.json --run
 ```
 
+## UI（macOS）
+
+开发运行（不打包）：
+
+```bash
+source .venv/bin/activate
+python -m mirroring_keymap.ui_main
+```
+
+打包生成可双击启动的 `.app`：
+
+```bash
+./scripts/build_app.sh
+open dist/MirroringKeymap.app
+```
+
 ## 坐标说明
 
 当前实现使用 Quartz 全局坐标系（与 `CGEventGetLocation`/`CGWarpMouseCursorPosition` 一致，通常 **原点在主屏左下角**，单位为 points）。建议用 `mirroring-keymap pick` 取点，避免手工换算。
@@ -58,4 +74,3 @@ mirroring-keymap --config config.json --run
 - 紧急停止：`F12`（立即抬起所有按住并恢复光标）
 - 视角锁定：`CapsLock`（战斗/自由鼠标切换）
 - 背包：`Tab`（打开进入自由鼠标；关闭自动回战斗）
-
