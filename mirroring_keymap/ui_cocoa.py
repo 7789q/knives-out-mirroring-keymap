@@ -902,8 +902,28 @@ class AppDelegate(NSObject):
             self._alert("新增失败", "请填写触发键（例如：E / R / Space / 1）。")
             return
 
-        x = self._safe_float(self._custom_x, 0.0)
-        y = self._safe_float(self._custom_y, 0.0)
+        x_s = str(self._custom_x.stringValue() if self._custom_x else "").strip()
+        y_s = str(self._custom_y.stringValue() if self._custom_y else "").strip()
+        x = float(x_s) if x_s else None
+        y = float(y_s) if y_s else None
+        if x is None or y is None:
+            # 兼容：用户先点击“取点”，坐标会复制到剪贴板（JSON），这里可直接读取
+            try:
+                pb = NSPasteboard.generalPasteboard()
+                s = pb.stringForType_(NSPasteboardTypeString)
+                if s:
+                    d = json.loads(str(s))
+                    if isinstance(d, dict):
+                        if x is None and "x" in d:
+                            x = float(d["x"])
+                        if y is None and "y" in d:
+                            y = float(d["y"])
+            except Exception:
+                pass
+        if x is None or y is None:
+            self._alert("新增失败", "请填写 X/Y，或先取点（坐标会在剪贴板中）再添加。")
+            return
+
         hold = self._safe_int(self._custom_hold, 30)
         rrand_raw = str(self._custom_rrand.stringValue() if self._custom_rrand else "").strip()
         rrand = float(rrand_raw) if rrand_raw else None
