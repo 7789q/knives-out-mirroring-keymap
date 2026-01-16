@@ -59,6 +59,18 @@ class UIApp:
         profile_names = [p.name for p in cfg.profiles]
         return cfg, profile_names
 
+    def load_config_dict(self, path: str) -> dict:
+        p = Path(path).expanduser()
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("配置文件根节点必须是 JSON Object")
+        return data
+
+    def save_config_dict(self, path: str, data: dict) -> None:
+        p = Path(path).expanduser()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
     def default_config_path(self) -> str:
         base = Path.home() / "Library" / "Application Support" / "MirroringKeymap"
         return str(base / "config.json")
