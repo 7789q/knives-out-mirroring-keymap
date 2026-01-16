@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mirroring-keymap"
+version = "0.1.0"
+description = "macOS iPhone Mirroring 单指按键映射 / 时间片触控调度器（MVP）"
+readme = "README.md"
+requires-python = ">=3.9"
+
+# 依赖仅在 macOS 上生效；非 macOS 环境可用于解析配置/干跑。
+dependencies = [
+  "pyobjc-framework-Quartz>=10.0; platform_system=='Darwin'",
+  "pyobjc-framework-Cocoa>=10.0; platform_system=='Darwin'",
+]
+
+[project.scripts]
+mirroring-keymap = "mirroring_keymap.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["mirroring_keymap*"]
+

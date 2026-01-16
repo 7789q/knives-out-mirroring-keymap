@@ -1,0 +1,541 @@
+from __future__ import annotations
+
+import logging
+import random
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass
+from enum import Enum
+from typing import Deque, Optional
+
+from .config import AppConfig, CustomMapping, Point, ProfileConfig
+from .mathutil import add, normalize, random_point, scale
+from .macos.injector import CursorSnapshot, Injector
+from .macos.keycodes import keycode_for
+from .macos.window import is_target_frontmost
+
+
+class Mode(str, Enum):
+    PAUSED = "paused"
+    BATTLE = "battle"
+    FREE = "free"
+
+
+@dataclass(frozen=True)
+class TapRequest:
+    name: str
+    point: Point
+    hold_ms: int
+    rrand_px: Optional[float]
+
+
+@dataclass
+class WheelSession:
+    active: bool = False
+    cursor_origin: Optional[Point] = None
+    touch_pos: Optional[Point] = None
+    last_wheel_ts: float = 0.0
+    pending_steps: int = 0  # 累积滚轮步数（正负）
+
+
+class Engine:
+    def __init__(
+        self,
+        cfg: AppConfig,
+        profile: ProfileConfig,
+        injector: Injector,
+        *,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self._cfg = cfg
+        self._profile = profile
+        self._inj = injector
+        self._log = logger or logging.getLogger(__name__)
+
+        self._rng = random.Random()
+
+        # 热键预解析（失败时尽早报错）
+        g = cfg.global_
+        self._kc_enable = keycode_for(g.enableHotkey)
+        self._kc_panic = keycode_for(g.panicHotkey)
+        self._kc_caps = keycode_for(g.cameraLockKey)
+        self._kc_backpack = keycode_for(g.backpackKey)
+
+        # WASD
+        self._kc_w = keycode_for("W")
+        self._kc_a = keycode_for("A")
+        self._kc_s = keycode_for("S")
+        self._kc_d = keycode_for("D")
+
+        # custom tap mappings
+        self._custom_by_keycode: dict[int, CustomMapping] = {}
+        for m in cfg.customMappings:
+            try:
+                self._custom_by_keycode[keycode_for(m.key)] = m
+            except Exception as e:
+                self._log.warning("忽略自定义映射 %r：%s", m.name, e)
+
+        # 输入状态（由 EventTap 线程更新）
+        self._lock = threading.Lock()
+        self._keys_down: set[int] = set()
+        self._mouse_dx_acc: float = 0.0
+        self._mouse_dy_acc: float = 0.0
+        self._tap_queue: Deque[TapRequest] = deque()
+        self._wheel = WheelSession()
+
+        # 运行状态（由调度线程更新）
+        self._mapping_enabled: bool = False
+        self._camera_lock: bool = False
+        self._backpack_open: bool = False
+        self._target_active: bool = False
+        self._mode: Mode = Mode.PAUSED
+
+        self._last_camera_ts: float = 0.0
+        self._last_joystick_ts: float = 0.0
+        self._target_check_ts: float = 0.0
+
+        self._battle_cursor_snap: Optional[CursorSnapshot] = None
+
+        self._stop_evt = threading.Event()
+        self._thread = threading.Thread(target=self._run_loop, name="scheduler", daemon=True)
+
+    # -------------------------
+    # Public API
+    # -------------------------
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+        self._thread.join(timeout=1.0)
+        self._safe_release_all()
+
+    def is_mapping_enabled(self) -> bool:
+        with self._lock:
+            return self._mapping_enabled
+
+    def current_mode(self) -> Mode:
+        with self._lock:
+            return self._mode
+
+    # -------------------------
+    # EventTap callback
+    # -------------------------
+
+    def handle_event(self, event_type: int, event) -> bool:
+        """
+        返回 True 表示吞掉事件（不传递给系统）。
+        注意：此函数在 EventTap 回调里被调用，必须尽量轻量。
+        """
+        import Quartz
+
+        now = time.monotonic()
+
+        swallow = False
+        with self._lock:
+            mapping_enabled = self._mapping_enabled
+            target_active = self._target_active
+            mode = self._mode
+
+        # 即使映射未启用，也允许热键生效（但不吞输入）。
+        if event_type in (Quartz.kCGEventKeyDown, Quartz.kCGEventKeyUp, Quartz.kCGEventFlagsChanged):
+            kc = int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode))
+
+            is_down = event_type != Quartz.kCGEventKeyUp
+            with self._lock:
+                if is_down:
+                    self._keys_down.add(kc)
+                else:
+                    self._keys_down.discard(kc)
+
+            if event_type == Quartz.kCGEventKeyDown:
+                if kc == self._kc_enable:
+                    with self._lock:
+                        self._mapping_enabled = not self._mapping_enabled
+                        if not self._mapping_enabled:
+                            self._camera_lock = False
+                            self._backpack_open = False
+                    self._log.info("映射 %s", "启用" if self.is_mapping_enabled() else "禁用")
+                elif kc == self._kc_panic:
+                    with self._lock:
+                        self._mapping_enabled = False
+                        self._camera_lock = False
+                        self._backpack_open = False
+                    self._log.warning("紧急停止：已禁用映射并请求释放所有按住")
+                    self._safe_release_all()
+                elif kc == self._kc_backpack and mapping_enabled and target_active:
+                    # 背包切换：开 -> 强制自由鼠标；关 -> 自动回战斗且开启视角锁定
+                    with self._lock:
+                        opening = not self._backpack_open
+                        self._backpack_open = opening
+                        self._camera_lock = False if opening else True
+                        self._tap_queue.append(
+                            TapRequest(
+                                name="backpack",
+                                point=self._profile.points["I"],
+                                hold_ms=self._profile.fire.tapHoldMs,
+                                rrand_px=self._cfg.global_.rrandDefaultPx,
+                            )
+                        )
+                    self._log.info("背包 %s", "打开" if opening else "关闭")
+                else:
+                    # 自定义映射：仅战斗态生效
+                    if (
+                        event_type == Quartz.kCGEventKeyDown
+                        and mapping_enabled
+                        and target_active
+                        and mode == Mode.BATTLE
+                        and kc in self._custom_by_keycode
+                    ):
+                        m = self._custom_by_keycode[kc]
+                        with self._lock:
+                            self._tap_queue.append(
+                                TapRequest(
+                                    name=f"custom:{m.name}",
+                                    point=m.point,
+                                    hold_ms=m.tapHoldMs,
+                                    rrand_px=m.rrandPx,
+                                )
+                            )
+
+            # CapsLock 使用 flagsChanged 更可靠
+            if event_type == Quartz.kCGEventFlagsChanged and kc == self._kc_caps and mapping_enabled and target_active:
+                with self._lock:
+                    self._camera_lock = not self._camera_lock
+                    if self._camera_lock:
+                        self._backpack_open = False
+                self._log.info("视角锁定 %s", "开启" if self._camera_lock else "关闭")
+
+            # 吞吐策略
+            if mapping_enabled and target_active and mode == Mode.BATTLE:
+                # 战斗态吞掉键盘输入，避免系统快捷键/其他应用行为
+                swallow = True
+
+        elif event_type == Quartz.kCGEventMouseMoved:
+            if mapping_enabled and target_active and mode == Mode.BATTLE:
+                dx = float(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventDeltaX))
+                dy = float(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventDeltaY))
+                with self._lock:
+                    self._mouse_dx_acc += dx
+                    self._mouse_dy_acc += dy
+                swallow = True
+
+        elif event_type in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventRightMouseDown):
+            if mapping_enabled and target_active and mode == Mode.BATTLE:
+                # 用 Tap 代替原生点击
+                if event_type == Quartz.kCGEventLeftMouseDown:
+                    with self._lock:
+                        self._tap_queue.append(
+                            TapRequest(
+                                name="fire",
+                                point=self._profile.points["F"],
+                                hold_ms=self._profile.fire.tapHoldMs,
+                                rrand_px=self._profile.fire.rrandPx,
+                            )
+                        )
+                else:
+                    with self._lock:
+                        self._tap_queue.append(
+                            TapRequest(
+                                name="scope",
+                                point=self._profile.points["S"],
+                                hold_ms=self._profile.scope.tapHoldMs,
+                                rrand_px=self._profile.scope.rrandPx,
+                            )
+                        )
+                swallow = True
+
+        elif event_type == Quartz.kCGEventScrollWheel:
+            # 仅自由鼠标态处理滚轮映射；吞掉滚轮，避免双触发
+            if mapping_enabled and target_active and mode == Mode.FREE and self._profile.wheel.enabled:
+                delta = int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGScrollWheelEventDeltaAxis1))
+                if self._profile.wheel.invert:
+                    delta = -delta
+                if delta != 0:
+                    loc = Quartz.CGEventGetLocation(event)
+                    pos = (float(loc.x), float(loc.y))
+                    with self._lock:
+                        if not self._wheel.active:
+                            self._wheel.active = True
+                            self._wheel.cursor_origin = pos
+                            self._wheel.touch_pos = None  # 首次 tick 决定随机落点并 down
+                        self._wheel.last_wheel_ts = now
+                        self._wheel.pending_steps += 1 if delta > 0 else -1
+                swallow = True
+
+        _ = now
+        return swallow
+
+    # -------------------------
+    # Scheduler loop
+    # -------------------------
+
+    def _run_loop(self) -> None:
+        tick_hz = max(10, int(self._profile.scheduler.tickHz))
+        tick_dt = 1.0 / float(tick_hz)
+
+        while not self._stop_evt.is_set():
+            t0 = time.monotonic()
+            try:
+                self._tick(t0)
+            except Exception as e:
+                self._log.exception("tick error: %s", e)
+
+            elapsed = time.monotonic() - t0
+            sleep_s = max(0.0, tick_dt - elapsed)
+            time.sleep(sleep_s)
+
+    def _tick(self, now: float) -> None:
+        # 目标窗口检查不需要每 tick 都做
+        if now - self._target_check_ts >= 0.2:
+            active = False
+            try:
+                active = is_target_frontmost(self._cfg.targetWindow)
+            except Exception as e:
+                self._log.debug("target check failed: %s", e)
+            with self._lock:
+                self._target_active = active
+                self._target_check_ts = now
+
+        with self._lock:
+            mapping_enabled = self._mapping_enabled
+            target_active = self._target_active
+            camera_lock = self._camera_lock
+            backpack_open = self._backpack_open
+
+        if not mapping_enabled or not target_active:
+            self._set_mode(Mode.PAUSED)
+            self._safe_release_all()
+            return
+
+        if backpack_open or not camera_lock:
+            self._set_mode(Mode.FREE)
+            self._tick_free(now)
+            return
+
+        self._set_mode(Mode.BATTLE)
+        self._tick_battle(now)
+
+    def _set_mode(self, mode: Mode) -> None:
+        with self._lock:
+            if self._mode == mode:
+                return
+            prev = self._mode
+            self._mode = mode
+
+        # 处理模式切换的副作用（不要在锁内做注入）
+        if prev == Mode.BATTLE and mode != Mode.BATTLE:
+            # 退出战斗态：释放并恢复光标
+            self._safe_release_all()
+            if self._battle_cursor_snap is not None:
+                try:
+                    self._inj.restore_cursor(self._battle_cursor_snap)
+                except Exception:
+                    pass
+                self._battle_cursor_snap = None
+
+        if mode == Mode.BATTLE and prev != Mode.BATTLE:
+            # 进入战斗态：记录光标位置并隐藏
+            try:
+                self._battle_cursor_snap = self._inj.snapshot_cursor()
+                self._inj.hide_cursor()
+            except Exception:
+                self._battle_cursor_snap = None
+
+        self._log.info("mode: %s -> %s", prev.value, mode.value)
+
+    def _tick_free(self, now: float) -> None:
+        # 自由鼠标态：不做任何坐标映射，除滚轮映射外。
+        with self._lock:
+            wheel = self._wheel
+            pending_steps = wheel.pending_steps
+            last_ts = wheel.last_wheel_ts
+            active = wheel.active
+
+        if not active:
+            self._safe_release_all()
+            return
+
+        # 首次 tick：确定落点并按下
+        if wheel.touch_pos is None:
+            origin = wheel.cursor_origin or self._inj.get_cursor_pos()
+            r = self._profile.wheel.rrandPx
+            if r is None:
+                r = self._cfg.global_.rrandDefaultPx
+            p0 = random_point(origin, float(r or 0.0), rng=self._rng)
+            wheel.touch_pos = p0
+            try:
+                self._inj.left_down(p0)
+            except Exception as e:
+                self._log.debug("wheel down failed: %s", e)
+                self._wheel = WheelSession()  # reset
+                return
+
+        # 判断停止
+        stop_s = max(0.01, self._profile.wheel.stopMs / 1000.0)
+        if now - last_ts > stop_s:
+            try:
+                self._inj.left_up(wheel.touch_pos)
+            except Exception:
+                pass
+            if wheel.cursor_origin is not None:
+                try:
+                    self._inj.warp(wheel.cursor_origin)
+                except Exception:
+                    pass
+            with self._lock:
+                self._wheel = WheelSession()
+            return
+
+        if pending_steps == 0:
+            return
+
+        # 消耗一个 step
+        step = 1 if pending_steps > 0 else -1
+        with self._lock:
+            self._wheel.pending_steps -= step
+
+        cur = wheel.touch_pos
+        target = (cur[0], cur[1] + step * float(self._profile.wheel.dPx))
+        try:
+            self._inj.drag_smooth(cur, target, max_step_px=self._profile.scheduler.maxStepPx)
+            wheel.touch_pos = target
+        except Exception:
+            # 出错则重置，避免卡住
+            self._safe_release_all()
+            with self._lock:
+                self._wheel = WheelSession()
+
+    def _tick_battle(self, now: float) -> None:
+        # 1) Tap 抢占
+        req: Optional[TapRequest] = None
+        with self._lock:
+            if self._tap_queue:
+                req = self._tap_queue.popleft()
+        if req is not None:
+            self._service_tap(req)
+            return
+
+        # 2) Camera / Joystick 轮转
+        mouse_dx, mouse_dy = 0.0, 0.0
+        keys_down: set[int] = set()
+        with self._lock:
+            mouse_dx = self._mouse_dx_acc
+            mouse_dy = self._mouse_dy_acc
+            keys_down = set(self._keys_down)
+
+        want_move = any(k in keys_down for k in (self._kc_w, self._kc_a, self._kc_s, self._kc_d))
+
+        camera_interval = 1.0 / max(1.0, float(self._profile.scheduler.cameraMinHz))
+        joy_interval = 1.0 / max(1.0, float(self._profile.scheduler.joystickMinHz))
+
+        camera_due = (now - self._last_camera_ts) >= camera_interval and (abs(mouse_dx) + abs(mouse_dy)) > 0.0
+        joy_due = (now - self._last_joystick_ts) >= joy_interval and want_move
+
+        # 若两者都 due，优先服务更紧急的（按 overdue 比例）
+        if camera_due and joy_due:
+            cam_over = (now - self._last_camera_ts) / camera_interval
+            joy_over = (now - self._last_joystick_ts) / joy_interval
+            if cam_over >= joy_over:
+                self._service_camera(mouse_dx, mouse_dy)
+            else:
+                self._service_joystick(keys_down)
+            return
+
+        if camera_due:
+            self._service_camera(mouse_dx, mouse_dy)
+            return
+
+        if joy_due:
+            self._service_joystick(keys_down)
+            return
+
+        # 不 due 时：如果有鼠标输入，依然尽快服务 camera（更贴手）
+        tcam = float(self._profile.camera.tcamPx)
+        if abs(mouse_dx) + abs(mouse_dy) >= tcam:
+            self._service_camera(mouse_dx, mouse_dy)
+            return
+
+        # 否则如果在移动，则服务 joystick
+        if want_move:
+            self._service_joystick(keys_down)
+
+    def _service_tap(self, req: TapRequest) -> None:
+        # Tap 前先抬起，避免与 drag 状态混淆
+        self._safe_release_all()
+        p = req.point
+        r = req.rrand_px
+        if r is None:
+            r = self._cfg.global_.rrandDefaultPx
+        p2 = random_point(p, float(r or 0.0), rng=self._rng)
+        try:
+            self._inj.tap(p2, hold_ms=req.hold_ms)
+        finally:
+            # Tap 后恢复到“战斗态默认”——如果当前仍是战斗态，则继续隐藏光标
+            try:
+                if self.current_mode() == Mode.BATTLE:
+                    self._inj.hide_cursor()
+            except Exception:
+                pass
+
+    def _service_camera(self, dx: float, dy: float) -> None:
+        # 以 A 为锚点做一次短拖动：down -> drag -> up
+        with self._lock:
+            self._mouse_dx_acc = 0.0
+            self._mouse_dy_acc = 0.0
+
+        cam = self._profile.camera
+        a = self._profile.points["A"]
+
+        sx = dx * float(cam.sensitivity)
+        sy = dy * float(cam.sensitivity) * (-1.0 if cam.invertY else 1.0)
+
+        # 限幅
+        r = float(cam.radiusPx)
+        sx = max(-r, min(r, sx))
+        sy = max(-r, min(r, sy))
+        end = (a[0] + sx, a[1] + sy)
+
+        try:
+            self._inj.left_down(a)
+            self._inj.drag_smooth(a, end, max_step_px=self._profile.scheduler.maxStepPx)
+            self._inj.left_up(end)
+            self._last_camera_ts = time.monotonic()
+        except Exception:
+            self._safe_release_all()
+
+    def _service_joystick(self, keys_down: set[int]) -> None:
+        c = self._profile.points["C"]
+        joy = self._profile.joystick
+
+        vx = 0.0
+        vy = 0.0
+        if self._kc_w in keys_down:
+            vy += 1.0
+        if self._kc_s in keys_down:
+            vy -= 1.0
+        if self._kc_a in keys_down:
+            vx -= 1.0
+        if self._kc_d in keys_down:
+            vx += 1.0
+        v = normalize((vx, vy))
+        target = add(c, scale(v, float(joy.radiusPx)))
+
+        try:
+            self._inj.left_down(c)
+            self._inj.drag_smooth(c, target, max_step_px=self._profile.scheduler.maxStepPx)
+            # 轻微停留，减少“点一下就松”导致的不稳
+            time.sleep(0.006)
+            self._inj.left_up(target)
+            self._last_joystick_ts = time.monotonic()
+        except Exception:
+            self._safe_release_all()
+
+    def _safe_release_all(self) -> None:
+        try:
+            self._inj.release_all()
+        except Exception:
+            pass
+
