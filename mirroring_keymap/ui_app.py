@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from .config import AppConfig, ProfileConfig, load_config, select_profile
+from .default_config import DEFAULT_CONFIG_JSON
 
 
 def _is_macos() -> bool:
@@ -57,6 +58,16 @@ class UIApp:
         cfg = load_config(path)
         profile_names = [p.name for p in cfg.profiles]
         return cfg, profile_names
+
+    def default_config_path(self) -> str:
+        base = Path.home() / "Library" / "Application Support" / "MirroringKeymap"
+        return str(base / "config.json")
+
+    def ensure_default_config_exists(self, path: str) -> None:
+        p = Path(path).expanduser()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if not p.exists():
+            p.write_text(DEFAULT_CONFIG_JSON, encoding="utf-8")
 
     def start(self, cfg_path: str, profile_name: Optional[str]) -> None:
         if self._runtime is not None:

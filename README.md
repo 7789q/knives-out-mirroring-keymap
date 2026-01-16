@@ -64,6 +64,8 @@ python -m mirroring_keymap.ui_main
 open dist/MirroringKeymap.app
 ```
 
+首次启动 UI 时，会在 `~/Library/Application Support/MirroringKeymap/config.json` 自动生成一份默认配置（点位为占位值），你可以在 UI 里点“打开”直接编辑。
+
 ## 坐标说明
 
 当前实现使用 Quartz 全局坐标系（与 `CGEventGetLocation`/`CGWarpMouseCursorPosition` 一致，通常 **原点在主屏左下角**，单位为 points）。建议用 `mirroring-keymap pick` 取点，避免手工换算。
