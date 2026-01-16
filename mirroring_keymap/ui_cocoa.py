@@ -385,7 +385,7 @@ class AppDelegate(NSObject):
         self._custom_rrand = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 335, 200, 55, 24))
         content.addSubview_(self._custom_rrand)
 
-        btn_add = NSButton.alloc().initWithFrame_(NSMakeRect(xR + 395, 200, 90, 26))
+        btn_add = NSButton.alloc().initWithFrame_(NSMakeRect(xR + 320, 229, 120, 26))
         btn_add.setTitle_("添加/替换")
         btn_add.setBezelStyle_(NSBezelStyleRounded)
         btn_add.setTarget_(self)
