@@ -70,6 +70,11 @@ class AppDelegate(NSObject):
 
         self._create_menu()
         self._create_window()
+        # 首次启动时自动创建默认配置到用户目录，避免 .app Resources 下找不到 config.json
+        try:
+            self._app.ensure_default_config_exists(self._cfg_path())
+        except Exception as e:
+            self._log.debug("ensure default config failed: %s", e)
         self._refresh_profiles_from_current_path()
 
         self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
@@ -116,7 +121,7 @@ class AppDelegate(NSObject):
 
         # 配置路径
         self._cfg_path_field = NSTextField.alloc().initWithFrame_(NSMakeRect(20, 310, 420, 24))
-        self._cfg_path_field.setStringValue_(str(Path("config.json").resolve()))
+        self._cfg_path_field.setStringValue_(self._app.default_config_path())
         content.addSubview_(self._cfg_path_field)
 
         btn_choose = NSButton.alloc().initWithFrame_(NSMakeRect(450, 308, 80, 28))
