@@ -292,11 +292,29 @@ class AppDelegate(NSObject):
             self._log.debug("ensure default config failed: %s", e)
         self.onReloadConfig_(None)
 
+        # 如果上次保存时开启了覆盖层，则启动时自动恢复
+        try:
+            if self._chk_overlay is not None and bool(self._chk_overlay.state()):
+                self._ensure_overlay()
+                self._update_overlay()
+        except Exception:
+            pass
+
         self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             0.2, self, "onTimer:", None, True
         )
 
     def applicationWillTerminate_(self, _notification) -> None:
+        # 退出前尽量保存 UI 配置（用户诉求：一切以 UI 为准，无需手工编辑 config.json）
+        try:
+            if isinstance(self._cfg_dict, dict):
+                self._apply_ui_to_cfg()
+                self._app.save_config_dict(self._cfg_path(), self._cfg_dict)
+        except Exception as e:
+            try:
+                self._log.debug("persist config on quit failed: %s", e)
+            except Exception:
+                pass
         try:
             self._stop()
         except Exception:
@@ -421,6 +439,7 @@ class AppDelegate(NSObject):
         self._chk_enabled = NSButton.alloc().initWithFrame_(NSMakeRect(20, 500, 220, 24))
         self._chk_enabled.setButtonType_(NSButtonTypeSwitch)
         self._chk_enabled.setTitle_("启用映射（吞输入）")
+        self._chk_enabled.setState_(1)  # 默认启用：用户点击“开始”后可立即使用
         self._chk_enabled.setTarget_(self)
         self._chk_enabled.setAction_("onToggleEnabled:")
         content.addSubview_(self._chk_enabled)
@@ -428,6 +447,7 @@ class AppDelegate(NSObject):
         self._chk_camera = NSButton.alloc().initWithFrame_(NSMakeRect(20, 475, 220, 24))
         self._chk_camera.setButtonType_(NSButtonTypeSwitch)
         self._chk_camera.setTitle_("视角锁定（战斗态）")
+        self._chk_camera.setState_(1)  # 默认开启：避免“WASD 无反应”
         self._chk_camera.setTarget_(self)
         self._chk_camera.setAction_("onToggleCamera:")
         content.addSubview_(self._chk_camera)
@@ -435,6 +455,7 @@ class AppDelegate(NSObject):
         self._chk_overlay = NSButton.alloc().initWithFrame_(NSMakeRect(250, 500, 220, 24))
         self._chk_overlay.setButtonType_(NSButtonTypeSwitch)
         self._chk_overlay.setTitle_("显示点位标记（调试）")
+        self._chk_overlay.setState_(1)  # 默认显示：便于看见点击/摇杆标识
         self._chk_overlay.setTarget_(self)
         self._chk_overlay.setAction_("onToggleOverlay:")
         content.addSubview_(self._chk_overlay)
@@ -933,6 +954,19 @@ class AppDelegate(NSObject):
         if not isinstance(self._cfg_dict, dict):
             return
 
+        # UI 状态（不参与引擎配置解析）：用于记住上次 UI 勾选项/选中的配置档
+        ui = self._cfg_dict.get("ui")
+        if isinstance(ui, dict):
+            try:
+                if self._chk_enabled is not None and ui.get("mappingEnabled") is not None:
+                    self._chk_enabled.setState_(1 if bool(ui.get("mappingEnabled")) else 0)
+                if self._chk_camera is not None and ui.get("cameraLock") is not None:
+                    self._chk_camera.setState_(1 if bool(ui.get("cameraLock")) else 0)
+                if self._chk_overlay is not None and ui.get("overlayEnabled") is not None:
+                    self._chk_overlay.setState_(1 if bool(ui.get("overlayEnabled")) else 0)
+            except Exception:
+                pass
+
         tw = self._cfg_dict.get("targetWindow")
         if not isinstance(tw, dict):
             tw = {}
@@ -1167,6 +1201,19 @@ class AppDelegate(NSObject):
         if self._sched_max_step is not None:
             sched["maxStepPx"] = self._safe_float(self._sched_max_step, 6.0)
 
+        # 额外保存 UI 状态（不影响引擎配置解析）
+        ui = self._cfg_dict.get("ui")
+        if not isinstance(ui, dict):
+            ui = {}
+            self._cfg_dict["ui"] = ui
+        try:
+            ui["mappingEnabled"] = bool(self._chk_enabled.state()) if self._chk_enabled is not None else False
+            ui["cameraLock"] = bool(self._chk_camera.state()) if self._chk_camera is not None else False
+            ui["overlayEnabled"] = bool(self._chk_overlay.state()) if self._chk_overlay is not None else False
+            ui["lastProfile"] = self._selected_profile()
+        except Exception:
+            pass
+
     @objc.python_method
     def _refresh_custom_list(self) -> None:
         if self._custom_list is None:
@@ -1278,6 +1325,14 @@ class AppDelegate(NSObject):
             return
         try:
             self._app.start(self._cfg_path(), self._selected_profile())
+            # “启用映射/视角锁定”以 UI 勾选项为准（避免启动后 WASD 无反应）
+            try:
+                if self._chk_enabled is not None:
+                    self._app.set_mapping_enabled(bool(self._chk_enabled.state()))
+                if self._chk_camera is not None:
+                    self._app.set_camera_lock(bool(self._chk_camera.state()))
+            except Exception:
+                pass
         except Exception as e:
             self._alert("启动失败", str(e))
 
@@ -1417,11 +1472,20 @@ class AppDelegate(NSObject):
                 self._cfg_dict["profiles"] = [{"name": "Default", "points": {}}]
 
         current = self._selected_profile()
+        desired = None
+        try:
+            ui = self._cfg_dict.get("ui") if isinstance(self._cfg_dict, dict) else None
+            if isinstance(ui, dict):
+                desired = str(ui.get("lastProfile") or "").strip() or None
+        except Exception:
+            desired = None
         self._profile_popup.removeAllItems()
         for n in names:
             self._profile_popup.addItemWithTitle_(n)
         if current and current in names:
             self._profile_popup.selectItemWithTitle_(current)
+        elif desired and desired in names:
+            self._profile_popup.selectItemWithTitle_(desired)
         else:
             self._profile_popup.selectItemAtIndex_(0)
 
@@ -1446,14 +1510,6 @@ class AppDelegate(NSObject):
             return False
 
         path = self._cfg_path()
-        # 若配置文件被外部编辑过但 UI 还没重载，直接保存会把外部修改覆盖掉。
-        try:
-            cur_mtime = Path(path).expanduser().stat().st_mtime
-            if self._cfg_mtime is not None and cur_mtime != self._cfg_mtime:
-                self._alert("需要重载配置", "检测到配置文件已在外部修改。请先点击“重载配置”，确认内容后再保存/启动。")
-                return False
-        except Exception:
-            pass
         try:
             self._apply_ui_to_cfg()
             self._app.save_config_dict(path, self._cfg_dict)

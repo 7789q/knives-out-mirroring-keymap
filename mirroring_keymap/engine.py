@@ -251,6 +251,13 @@ class Engine:
 
         now = time.monotonic()
 
+        def _throttle(key: str, interval_s: float = 0.8) -> bool:
+            last = self._ignore_log_last.get(key, 0.0)
+            if now - last < interval_s:
+                return False
+            self._ignore_log_last[key] = now
+            return True
+
         swallow = False
         with self._lock:
             mapping_enabled = self._mapping_enabled
@@ -369,6 +376,13 @@ class Engine:
                                 )
                             self._log.debug("enqueue tap: custom:%s", m.key)
 
+                # 移动键提示：很多“WASD 无反应”实际是因为未开启战斗态（视角锁定）或目标未激活
+                if kc in (self._kc_move_up, self._kc_move_down, self._kc_move_left, self._kc_move_right) and mapping_enabled:
+                    if not target_active and _throttle("move_key_ignored_target"):
+                        self._log.warning("移动键被忽略：目标窗口未激活/未命中（可在配置中关闭目标检测）")
+                    elif mode != Mode.BATTLE and _throttle("move_key_ignored_mode"):
+                        self._log.warning("移动键被忽略：当前模式=%s（需要开启“视角锁定/战斗模式”）", mode.value)
+
             # CapsLock 使用 flagsChanged 更可靠
             if event_type == Quartz.kCGEventFlagsChanged and kc == self._kc_caps and mapping_enabled and target_active:
                 with self._lock:
@@ -393,13 +407,6 @@ class Engine:
                 swallow = True
 
         elif event_type in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventRightMouseDown):
-            def _throttle(key: str, interval_s: float = 0.8) -> bool:
-                last = self._ignore_log_last.get(key, 0.0)
-                if now - last < interval_s:
-                    return False
-                self._ignore_log_last[key] = now
-                return True
-
             # 鼠标触发下：当用户已启用映射但条件不满足时，给出更明确的日志（避免“按了没反应”）
             if (self._fire_trigger[0] == "mouse" or self._scope_trigger[0] == "mouse") and mapping_enabled:
                 if not target_active and _throttle("mouse_click_ignored_target"):
@@ -810,13 +817,29 @@ class Engine:
         v = normalize((vx, vy))
         target = add(c, scale(v, float(joy.radiusPx)))
 
+        # 覆盖层可视化：WASD（或自定义移动键）对应的摇杆目标点
+        try:
+            g = self._cfg.global_
+            label = f"摇杆({g.moveUpKey}/{g.moveDownKey}/{g.moveLeftKey}/{g.moveRightKey})"
+        except Exception:
+            label = "摇杆"
+        now = time.monotonic()
+        with self._lock:
+            self._click_markers["joystick"] = ClickMarker(
+                x=float(target[0]),
+                y=float(target[1]),
+                label=label,
+                pressed_until_ts=now + 0.35,
+            )
+
         try:
             self._inj.left_down(c)
             self._inj.drag_smooth(c, target, max_step_px=self._profile.scheduler.maxStepPx)
-            # 轻微停留，减少“点一下就松”导致的不稳
-            time.sleep(0.006)
+            # 轻微停留，避免 iPhone Mirroring/游戏端把过短触碰当作无效
+            hold_s = max(0.02, min(0.03, float(joy.tauMs) / 1000.0))
+            time.sleep(hold_s)
             self._inj.left_up(target)
-            self._last_joystick_ts = time.monotonic()
+            self._last_joystick_ts = now
         except Exception:
             self._safe_release_all()
 
