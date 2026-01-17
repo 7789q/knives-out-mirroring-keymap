@@ -28,6 +28,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             "version": cfg.version,
             "targetWindow": {
                 "titleHint": cfg.targetWindow.titleHint,
+                "enabled": cfg.targetWindow.enabled,
                 "pid": cfg.targetWindow.pid,
                 "windowId": cfg.targetWindow.windowId,
             },

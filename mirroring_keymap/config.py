@@ -22,6 +22,8 @@ def _as_point(v: Any, *, field: str) -> Point:
 @dataclass(frozen=True)
 class TargetWindowConfig:
     titleHint: str
+    # 关闭后将跳过目标窗口检测（映射启用时对所有前台应用生效）
+    enabled: bool = True
     pid: Optional[int] = None
     windowId: Optional[int] = None
 
@@ -72,6 +74,8 @@ class WheelConfig:
     dPx: float = 8.0
     stopMs: int = 120
     invert: bool = False
+    # 锁定视角（战斗模式）下的滚轮拖动锚点坐标；未设置则回退到 cameraAnchor
+    anchorPoint: Optional[Point] = None
     rrandPx: Optional[float] = None
 
 
@@ -133,11 +137,12 @@ def load_config(path: str | Path) -> AppConfig:
     if not isinstance(tw, dict):
         raise ValueError("targetWindow 必须是对象")
     title_hint = str(tw.get("titleHint") or "iPhone Mirroring")
+    enabled = bool(tw.get("enabled") if tw.get("enabled") is not None else True)
     pid = tw.get("pid", None)
     pid_i = int(pid) if isinstance(pid, int) else None
     wid = tw.get("windowId", None)
     wid_i = int(wid) if isinstance(wid, int) else None
-    target = TargetWindowConfig(titleHint=title_hint, pid=pid_i, windowId=wid_i)
+    target = TargetWindowConfig(titleHint=title_hint, enabled=enabled, pid=pid_i, windowId=wid_i)
 
     g = data.get("global") or {}
     if not isinstance(g, dict):
@@ -228,6 +233,15 @@ def load_config(path: str | Path) -> AppConfig:
             dPx=float(wheel_raw.get("dPx") or 8.0),
             stopMs=int(wheel_raw.get("stopMs") or 120),
             invert=bool(wheel_raw.get("invert") or False),
+            anchorPoint=(
+                _as_point(wheel_raw.get("anchorPoint"), field=f"profiles[{i}].wheel.anchorPoint")
+                if wheel_raw.get("anchorPoint") is not None
+                else (
+                    _as_point(wheel_raw.get("anchor"), field=f"profiles[{i}].wheel.anchorPoint")
+                    if wheel_raw.get("anchor") is not None
+                    else None
+                )
+            ),
             rrandPx=(float(wheel_raw["rrandPx"]) if wheel_raw.get("rrandPx") is not None else None),
         )
         scheduler = SchedulerConfig(
