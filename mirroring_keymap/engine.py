@@ -104,7 +104,8 @@ class Engine:
         self._camera_lock: bool = False
         self._backpack_open: bool = False
         self._target_active: bool = False
-        self._target_check_enabled: bool = bool(cfg.targetWindow.enabled)
+        # 用户诉求：不需要检测目标窗口。映射启用时默认对所有前台应用生效（但前台是本程序时会自动暂停）。
+        self._target_check_enabled: bool = False
         self._mode: Mode = Mode.PAUSED
 
         self._last_camera_ts: float = 0.0
@@ -265,6 +266,23 @@ class Engine:
             target_active = self._target_active
             mode = self._mode
 
+        # 当未启用“目标窗口检测”时，我们会在 tick 里用“前台是否为本程序”来暂停映射，
+        # 但 tick 有时间片（默认 0.2s）。为了避免用户刚点击 UI 窗口的那一下被吞掉并触发游戏点击，
+        # 这里对“低频交互事件”做一次即时判断：若前台是本程序，则绝不映射/吞输入。
+        if mapping_enabled and not self._target_check_enabled and event_type in (
+            Quartz.kCGEventKeyDown,
+            Quartz.kCGEventKeyUp,
+            Quartz.kCGEventFlagsChanged,
+            Quartz.kCGEventLeftMouseDown,
+            Quartz.kCGEventRightMouseDown,
+            Quartz.kCGEventScrollWheel,
+        ):
+            try:
+                if get_frontmost().pid == os.getpid():
+                    return False
+            except Exception:
+                pass
+
         # 即使映射未启用，也允许热键生效（但不吞输入）。
         if event_type in (Quartz.kCGEventKeyDown, Quartz.kCGEventKeyUp, Quartz.kCGEventFlagsChanged):
             kc = int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode))
@@ -398,7 +416,7 @@ class Engine:
                 # 战斗态吞掉键盘输入，避免系统快捷键/其他应用行为
                 swallow = True
 
-        elif event_type == Quartz.kCGEventMouseMoved:
+        elif event_type in (Quartz.kCGEventMouseMoved, Quartz.kCGEventLeftMouseDragged):
             if mapping_enabled and target_active and mode == Mode.BATTLE:
                 dx = float(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventDeltaX))
                 dy = float(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventDeltaY))
@@ -600,7 +618,16 @@ class Engine:
         self._log.info("mode: %s -> %s", prev.value, mode.value)
 
     def _tick_free(self, now: float) -> None:
-        # 自由鼠标态：不做任何坐标映射，除滚轮映射外。
+        # 自由鼠标态：默认不做坐标映射，除滚轮映射外。
+        # 但背包开关等 Tap 请求需要在自由态也能执行（否则背包永远打不开/关不掉）。
+        req: Optional[TapRequest] = None
+        with self._lock:
+            if self._tap_queue:
+                req = self._tap_queue.popleft()
+        if req is not None:
+            self._service_tap(req)
+            return
+
         if self._service_wheel(now):
             return
         self._safe_release_all()
@@ -800,9 +827,25 @@ class Engine:
         sy = max(-r, min(r, sy))
         end = (a[0] + sx, a[1] + sy)
 
+        # 覆盖层可视化：视角拖动的目标点
+        try:
+            now = time.monotonic()
+            with self._lock:
+                self._click_markers["camera"] = ClickMarker(
+                    x=float(end[0]),
+                    y=float(end[1]),
+                    label="视角拖动",
+                    pressed_until_ts=now + 0.20,
+                )
+        except Exception:
+            pass
+
         try:
             self._inj.left_down(a)
-            self._inj.drag_smooth(a, end, max_step_px=self._profile.scheduler.maxStepPx)
+            # 过短的按下/拖动在 iPhone Mirroring/游戏侧可能被过滤；给一个很小的按下窗口。
+            time.sleep(0.01)
+            self._inj.drag_smooth(a, end, max_step_px=self._profile.scheduler.maxStepPx, step_delay_s=0.001)
+            time.sleep(0.01)
             self._inj.left_up(end)
             self._last_camera_ts = time.monotonic()
         except Exception:
@@ -815,9 +858,10 @@ class Engine:
         vx = 0.0
         vy = 0.0
         if self._kc_move_up in keys_down:
-            vy += 1.0
-        if self._kc_move_down in keys_down:
+            # Quartz 坐标系 Y 向下：向上移动需要减小 Y
             vy -= 1.0
+        if self._kc_move_down in keys_down:
+            vy += 1.0
         if self._kc_move_left in keys_down:
             vx -= 1.0
         if self._kc_move_right in keys_down:
@@ -842,9 +886,11 @@ class Engine:
 
         try:
             self._inj.left_down(c)
-            self._inj.drag_smooth(c, target, max_step_px=self._profile.scheduler.maxStepPx)
+            time.sleep(0.01)
+            self._inj.drag_smooth(c, target, max_step_px=self._profile.scheduler.maxStepPx, step_delay_s=0.001)
             # 轻微停留，避免 iPhone Mirroring/游戏端把过短触碰当作无效
-            hold_s = max(0.02, min(0.03, float(joy.tauMs) / 1000.0))
+            hold_s = max(0.03, float(joy.tauMs) / 1000.0)
+            hold_s = min(0.12, hold_s)
             time.sleep(hold_s)
             self._inj.left_up(target)
             self._last_joystick_ts = now

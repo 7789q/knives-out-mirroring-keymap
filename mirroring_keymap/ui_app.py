@@ -53,6 +53,7 @@ class UIApp:
         self._log_buf: deque[str] = deque(maxlen=400)
         self._log_lock = Lock()
         self._log_path = self._default_log_path()
+        self._file_handler: Optional[RotatingFileHandler] = None
         self._ensure_logging()
 
     def _default_log_path(self) -> Path:
@@ -78,6 +79,7 @@ class UIApp:
             fh.setLevel(logging.DEBUG)
             fh.setFormatter(fmt)
             root.addHandler(fh)
+            self._file_handler = fh
         except Exception:
             # 不阻塞启动（例如无权限/路径不可写）
             pass
@@ -140,9 +142,22 @@ class UIApp:
     def clear_logs(self) -> None:
         with self._log_lock:
             self._log_buf.clear()
+        # 尽量原地截断（避免 file handler 仍持有旧 fd 导致写入偏移异常）
         try:
-            self._log_path.parent.mkdir(parents=True, exist_ok=True)
-            self._log_path.write_text("", encoding="utf-8")
+            fh = self._file_handler
+            if fh is not None:
+                try:
+                    fh.acquire()
+                    if fh.stream is None:
+                        fh.stream = fh._open()  # type: ignore[attr-defined]
+                    fh.stream.seek(0)
+                    fh.stream.truncate(0)
+                    fh.stream.flush()
+                finally:
+                    fh.release()
+            else:
+                self._log_path.parent.mkdir(parents=True, exist_ok=True)
+                self._log_path.write_text("", encoding="utf-8")
         except Exception:
             pass
 
@@ -159,6 +174,8 @@ class UIApp:
     def start(self, cfg_path: str, profile_name: Optional[str]) -> None:
         if self._runtime is not None:
             self.stop()
+        # 用户诉求：每次启动服务都清空旧日志，便于排查本次问题
+        self.clear_logs()
 
         cfg_path_p = Path(cfg_path).expanduser()
         cfg = load_config(cfg_path_p)

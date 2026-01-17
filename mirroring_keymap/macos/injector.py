@@ -86,13 +86,15 @@ class Injector:
         self.warp(pos)
         self._post_mouse(self._Quartz.kCGEventLeftMouseDragged, pos, self._Quartz.kCGMouseButtonLeft)
 
-    def drag_smooth(self, start: Point, end: Point, *, max_step_px: float) -> None:
+    def drag_smooth(self, start: Point, end: Point, *, max_step_px: float, step_delay_s: float = 0.0) -> None:
         if not self._left_down:
             self.left_down(start)
         cur = start
         for p in segment_points(start, end, max_step=max_step_px):
             cur = p
             self.left_drag(p)
+            if step_delay_s > 0:
+                time.sleep(step_delay_s)
         # 保持按住，由调用方决定何时 up
         _ = cur
 
@@ -114,4 +116,3 @@ class Injector:
     @property
     def user_data_tag(self) -> int:
         return self._user_data_tag
-
