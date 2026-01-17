@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import deque
+from logging.handlers import RotatingFileHandler
 import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Optional
 
 from .config import AppConfig, ProfileConfig, load_config, select_profile
@@ -26,10 +29,68 @@ class Runtime:
     capture: object
 
 
+class _RingBufferHandler(logging.Handler):
+    def __init__(self, buf: deque[str], lock: Lock) -> None:
+        super().__init__()
+        self._buf = buf
+        self._lock = lock
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+        except Exception:
+            msg = record.getMessage()
+        with self._lock:
+            self._buf.append(msg)
+
+
 class UIApp:
     def __init__(self) -> None:
         self._log = logging.getLogger("mirroring_keymap.ui")
         self._runtime: Optional[Runtime] = None
+
+        # 供 UI 展示的最近日志（不依赖控制台）
+        self._log_buf: deque[str] = deque(maxlen=400)
+        self._log_lock = Lock()
+        self._log_path = self._default_log_path()
+        self._ensure_logging()
+
+    def _default_log_path(self) -> Path:
+        return Path.home() / "Library" / "Logs" / "MirroringKeymap" / "mirroring_keymap.log"
+
+    def log_path(self) -> str:
+        return str(self._log_path)
+
+    def _ensure_logging(self) -> None:
+        root = logging.getLogger()
+
+        fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+        # File handler
+        try:
+            self._log_path.parent.mkdir(parents=True, exist_ok=True)
+            fh = RotatingFileHandler(
+                str(self._log_path),
+                maxBytes=512 * 1024,
+                backupCount=3,
+                encoding="utf-8",
+            )
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(fmt)
+            root.addHandler(fh)
+        except Exception:
+            # 不阻塞启动（例如无权限/路径不可写）
+            pass
+
+        # Ring buffer handler (for in-app view)
+        bh = _RingBufferHandler(self._log_buf, self._log_lock)
+        bh.setLevel(logging.DEBUG)
+        bh.setFormatter(fmt)
+        root.addHandler(bh)
+
+        # 默认 INFO；用户可在 UI 中切换到 DEBUG
+        if root.level == logging.NOTSET:
+            root.setLevel(logging.INFO)
 
     # --------------------
     # Public entry
@@ -70,6 +131,20 @@ class UIApp:
         p = Path(path).expanduser()
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def get_recent_logs(self, max_lines: int = 200) -> str:
+        with self._log_lock:
+            lines = list(self._log_buf)[-max_lines:]
+        return "\n".join(lines)
+
+    def clear_logs(self) -> None:
+        with self._log_lock:
+            self._log_buf.clear()
+        try:
+            self._log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._log_path.write_text("", encoding="utf-8")
+        except Exception:
+            pass
 
     def default_config_path(self) -> str:
         base = Path.home() / "Library" / "Application Support" / "MirroringKeymap"

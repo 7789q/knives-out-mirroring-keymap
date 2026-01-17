@@ -16,6 +16,9 @@ from AppKit import (
     NSButton,
     NSButtonTypeMomentaryPushIn,
     NSButtonTypeSwitch,
+    NSColor,
+    NSFont,
+    NSBezierPath,
     NSMakeRect,
     NSMenu,
     NSMenuItem,
@@ -25,14 +28,162 @@ from AppKit import (
     NSPasteboardTypeString,
     NSPopUpButton,
     NSRunningApplication,
+    NSScreen,
+    NSScrollView,
     NSTextField,
+    NSTextView,
     NSTimer,
+    NSView,
     NSWindow,
+    NSWindowCollectionBehaviorCanJoinAllSpaces,
+    NSWindowCollectionBehaviorFullScreenAuxiliary,
+    NSWindowStyleMaskBorderless,
     NSWindowStyleMaskClosable,
     NSWindowStyleMaskMiniaturizable,
     NSWindowStyleMaskResizable,
     NSWindowStyleMaskTitled,
 )
+from Foundation import NSString
+
+
+class _MarkerView(NSView):
+    def initWithFrame_(self, frame):  # type: ignore[override]
+        self = objc.super(_MarkerView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._markers = []
+        return self
+
+    @objc.python_method
+    def set_markers(self, markers: list[dict]) -> None:
+        self._markers = markers
+        try:
+            self.setNeedsDisplay_(True)
+        except Exception:
+            pass
+
+    def isFlipped(self):  # type: ignore[override]
+        # 保持与屏幕全局坐标一致：原点左下，Y 向上
+        return False
+
+    def drawRect_(self, rect) -> None:  # type: ignore[override]
+        # 透明覆盖层，仅绘制点位标记
+        _ = rect
+        try:
+            for m in self._markers:
+                x = float(m.get("x", 0.0))
+                y = float(m.get("y", 0.0))
+                r = float(m.get("r", 7.0))
+                color = m.get("color") or NSColor.systemRedColor()
+                label = str(m.get("label") or "")
+
+                # 外圈
+                NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.15).setFill()
+                bg = NSBezierPath.bezierPathWithOvalInRect_(NSMakeRect(x - r - 3, y - r - 3, (r + 3) * 2, (r + 3) * 2))
+                bg.fill()
+
+                color.colorWithAlphaComponent_(0.35).setFill()
+                path = NSBezierPath.bezierPathWithOvalInRect_(NSMakeRect(x - r, y - r, r * 2, r * 2))
+                path.fill()
+                color.setStroke()
+                path.setLineWidth_(2.0)
+                path.stroke()
+
+                # 十字
+                NSColor.whiteColor().colorWithAlphaComponent_(0.8).setStroke()
+                cross = NSBezierPath.bezierPath()
+                cross.moveToPoint_((x - (r + 6), y))
+                cross.lineToPoint_((x + (r + 6), y))
+                cross.moveToPoint_((x, y - (r + 6)))
+                cross.lineToPoint_((x, y + (r + 6)))
+                cross.setLineWidth_(1.0)
+                cross.stroke()
+
+                if label:
+                    attrs = {
+                        "NSFont": NSFont.systemFontOfSize_(12),
+                        "NSColor": NSColor.whiteColor().colorWithAlphaComponent_(0.85),
+                    }
+                    try:
+                        NSString.stringWithString_(label).drawAtPoint_withAttributes_((x + r + 8, y + r + 6), attrs)
+                    except Exception:
+                        pass
+        except Exception:
+            # 绘制失败不应影响主程序
+            pass
+
+
+class _MarkerOverlay:
+    def __init__(self) -> None:
+        self._windows: list[NSWindow] = []
+        self._views: list[_MarkerView] = []
+
+    def show(self) -> None:
+        if self._windows:
+            for w in self._windows:
+                try:
+                    w.orderFront_(None)
+                except Exception:
+                    pass
+            return
+
+        for screen in NSScreen.screens() or []:
+            frame = screen.frame()
+            w = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(frame, NSWindowStyleMaskBorderless, 2, False)
+            w.setOpaque_(False)
+            w.setBackgroundColor_(NSColor.clearColor())
+            w.setIgnoresMouseEvents_(True)
+            try:
+                w.setLevel_(10_000)  # 近似浮层（避免依赖常量在不同 pyobjc 版本不一致）
+            except Exception:
+                pass
+            try:
+                w.setCollectionBehavior_(
+                    NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary
+                )
+            except Exception:
+                pass
+
+            v = _MarkerView.alloc().initWithFrame_(NSMakeRect(0, 0, frame.size.width, frame.size.height))
+            w.setContentView_(v)
+            w.orderFront_(None)
+            self._windows.append(w)
+            self._views.append(v)
+
+    def hide(self) -> None:
+        for w in self._windows:
+            try:
+                w.orderOut_(None)
+            except Exception:
+                pass
+        self._windows = []
+        self._views = []
+
+    def update(self, markers_global: list[dict]) -> None:
+        if not self._windows:
+            return
+
+        # 按屏幕分发坐标（全局 -> 每屏局部）
+        per_view: list[list[dict]] = [[] for _ in self._views]
+        for m in markers_global:
+            try:
+                gx = float(m.get("x", 0.0))
+                gy = float(m.get("y", 0.0))
+            except Exception:
+                continue
+            for idx, w in enumerate(self._windows):
+                frame = w.frame()
+                fx = frame.origin.x
+                fy = frame.origin.y
+                if gx >= fx and gx <= fx + frame.size.width and gy >= fy and gy <= fy + frame.size.height:
+                    mm = dict(m)
+                    mm["x"] = gx - fx
+                    mm["y"] = gy - fy
+                    per_view[idx].append(mm)
+                    break
+
+        for v, lst in zip(self._views, per_view):
+            v.set_markers(lst)
 
 
 class AppDelegate(NSObject):
@@ -52,9 +203,11 @@ class AppDelegate(NSObject):
         self._btn_start = None
         self._btn_stop = None
         self._btn_open_cfg = None
+        self._btn_logs = None
 
         self._chk_enabled = None
         self._chk_camera = None
+        self._chk_overlay = None
 
         self._lbl_status = None
         self._lbl_pick = None
@@ -102,6 +255,18 @@ class AppDelegate(NSObject):
         self._custom_rrand = None
         self._custom_remove_index = None
         self._custom_list = None
+
+        # target window config
+        self._tw_title_hint = None
+        self._tw_pid = None
+        self._btn_tw_detect = None
+
+        # 日志窗口
+        self._log_window = None
+        self._log_text = None
+
+        # 点位标记覆盖层
+        self._overlay = None
         return self
 
     # --------------------
@@ -128,6 +293,11 @@ class AppDelegate(NSObject):
     def applicationWillTerminate_(self, _notification) -> None:
         try:
             self._stop()
+        except Exception:
+            pass
+        try:
+            if self._overlay is not None:
+                self._overlay.hide()
         except Exception:
             pass
 
@@ -234,6 +404,13 @@ class AppDelegate(NSObject):
         btn_panic.setAction_("onPanic:")
         content.addSubview_(btn_panic)
 
+        self._btn_logs = NSButton.alloc().initWithFrame_(NSMakeRect(410, 535, 120, 32))
+        self._btn_logs.setTitle_("查看日志")
+        self._btn_logs.setBezelStyle_(NSBezelStyleRounded)
+        self._btn_logs.setTarget_(self)
+        self._btn_logs.setAction_("onShowLogs:")
+        content.addSubview_(self._btn_logs)
+
         # toggles
         self._chk_enabled = NSButton.alloc().initWithFrame_(NSMakeRect(20, 500, 220, 24))
         self._chk_enabled.setButtonType_(NSButtonTypeSwitch)
@@ -249,12 +426,33 @@ class AppDelegate(NSObject):
         self._chk_camera.setAction_("onToggleCamera:")
         content.addSubview_(self._chk_camera)
 
+        self._chk_overlay = NSButton.alloc().initWithFrame_(NSMakeRect(250, 500, 220, 24))
+        self._chk_overlay.setButtonType_(NSButtonTypeSwitch)
+        self._chk_overlay.setTitle_("显示点位标记（调试）")
+        self._chk_overlay.setTarget_(self)
+        self._chk_overlay.setAction_("onToggleOverlay:")
+        content.addSubview_(self._chk_overlay)
+
         btn_backpack = NSButton.alloc().initWithFrame_(NSMakeRect(250, 472, 120, 28))
         btn_backpack.setTitle_("背包切换")
         btn_backpack.setBezelStyle_(NSBezelStyleRounded)
         btn_backpack.setTarget_(self)
         btn_backpack.setAction_("onBackpack:")
         content.addSubview_(btn_backpack)
+
+        # 目标窗口设置（避免 titleHint 不匹配导致“无反应”）
+        content.addSubview_(_label("目标窗口", 435, 505, 60))
+        self._tw_title_hint = NSTextField.alloc().initWithFrame_(NSMakeRect(495, 500, 190, 24))
+        content.addSubview_(self._tw_title_hint)
+        content.addSubview_(_label("PID", 690, 505, 28))
+        self._tw_pid = NSTextField.alloc().initWithFrame_(NSMakeRect(720, 500, 70, 24))
+        content.addSubview_(self._tw_pid)
+        self._btn_tw_detect = NSButton.alloc().initWithFrame_(NSMakeRect(800, 499, 90, 26))
+        self._btn_tw_detect.setTitle_("取前台")
+        self._btn_tw_detect.setBezelStyle_(NSBezelStyleRounded)
+        self._btn_tw_detect.setTarget_(self)
+        self._btn_tw_detect.setAction_("onDetectFrontmost:")
+        content.addSubview_(self._btn_tw_detect)
 
         # pick point
         btn_pick = NSButton.alloc().initWithFrame_(NSMakeRect(20, 435, 120, 28))
@@ -494,6 +692,134 @@ class AppDelegate(NSObject):
         return name or None
 
     @objc.python_method
+    def _ensure_log_window(self) -> None:
+        if self._log_window is not None:
+            return
+
+        style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
+        w = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(NSMakeRect(0, 0, 820, 460), style, 2, False)
+        w.setTitle_("运行日志")
+        w.center()
+
+        content = w.contentView()
+
+        # 顶部说明 + 路径
+        lbl_path = NSTextField.alloc().initWithFrame_(NSMakeRect(12, 430, 796, 20))
+        lbl_path.setEditable_(False)
+        lbl_path.setBordered_(False)
+        lbl_path.setDrawsBackground_(False)
+        try:
+            lbl_path.setStringValue_(f"日志文件：{self._app.log_path()}")
+        except Exception:
+            lbl_path.setStringValue_("日志文件：-")
+        content.addSubview_(lbl_path)
+
+        # 文本区（可滚动）
+        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(12, 52, 796, 370))
+        scroll.setHasVerticalScroller_(True)
+        scroll.setHasHorizontalScroller_(False)
+
+        tv = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, 796, 370))
+        tv.setEditable_(False)
+        tv.setSelectable_(True)
+        try:
+            tv.setFont_(NSFont.userFixedPitchFontOfSize_(12))
+        except Exception:
+            pass
+        scroll.setDocumentView_(tv)
+        content.addSubview_(scroll)
+
+        btn_open = NSButton.alloc().initWithFrame_(NSMakeRect(12, 12, 140, 30))
+        btn_open.setTitle_("打开日志文件")
+        btn_open.setBezelStyle_(NSBezelStyleRounded)
+        btn_open.setTarget_(self)
+        btn_open.setAction_("onOpenLogFile:")
+        content.addSubview_(btn_open)
+
+        btn_clear = NSButton.alloc().initWithFrame_(NSMakeRect(160, 12, 120, 30))
+        btn_clear.setTitle_("清空日志")
+        btn_clear.setBezelStyle_(NSBezelStyleRounded)
+        btn_clear.setTarget_(self)
+        btn_clear.setAction_("onClearLogs:")
+        content.addSubview_(btn_clear)
+
+        self._log_window = w
+        self._log_text = tv
+        self._update_log_window()
+
+    @objc.python_method
+    def _update_log_window(self) -> None:
+        if self._log_window is None or self._log_text is None:
+            return
+        try:
+            s = self._app.get_recent_logs(400)
+        except Exception:
+            s = ""
+        try:
+            self._log_text.setString_(s or "(暂无日志)")
+            # 滚动到末尾
+            self._log_text.scrollRangeToVisible_((len(s), 0))
+        except Exception:
+            pass
+
+    @objc.python_method
+    def _ensure_overlay(self) -> None:
+        if self._overlay is None:
+            self._overlay = _MarkerOverlay()
+        self._overlay.show()
+
+    @objc.python_method
+    def _build_markers(self) -> list[dict]:
+        markers: list[dict] = []
+
+        color_map = {
+            "joystickCenter": (NSColor.systemGreenColor(), "摇杆中心"),
+            "cameraAnchor": (NSColor.systemBlueColor(), "视角锚点"),
+            "fire": (NSColor.systemRedColor(), "开火"),
+            "scope": (NSColor.systemPurpleColor(), "开镜"),
+            "backpack": (NSColor.systemOrangeColor(), "背包"),
+        }
+
+        for k, (fx, fy) in self._point_fields.items():
+            x = self._safe_float(fx, float("nan"))
+            y = self._safe_float(fy, float("nan"))
+            if x != x or y != y:  # NaN check
+                continue
+            color, label = color_map.get(k, (NSColor.systemGrayColor(), k))
+            markers.append({"x": x, "y": y, "r": 7.0, "color": color, "label": label})
+
+        # 自定义点击：从配置里读取（已保存为准）
+        if isinstance(self._cfg_dict, dict):
+            lst = self._cfg_dict.get("customMappings")
+            if isinstance(lst, list):
+                for m in lst:
+                    if not isinstance(m, dict):
+                        continue
+                    pt = m.get("point")
+                    if not (isinstance(pt, (list, tuple)) and len(pt) == 2):
+                        continue
+                    try:
+                        x = float(pt[0])
+                        y = float(pt[1])
+                    except Exception:
+                        continue
+                    key = str(m.get("key") or "").strip()
+                    name = str(m.get("name") or "").strip()
+                    label = f"{key}:{name}" if key or name else "自定义"
+                    markers.append({"x": x, "y": y, "r": 6.0, "color": NSColor.systemTealColor(), "label": label})
+
+        return markers
+
+    @objc.python_method
+    def _update_overlay(self) -> None:
+        if self._overlay is None:
+            return
+        try:
+            self._overlay.update(self._build_markers())
+        except Exception:
+            pass
+
+    @objc.python_method
     def _refresh_profiles_from_current_path(self) -> None:
         self.onReloadConfig_(None)
 
@@ -546,6 +872,15 @@ class AppDelegate(NSObject):
     def _sync_ui_from_cfg(self) -> None:
         if not isinstance(self._cfg_dict, dict):
             return
+
+        tw = self._cfg_dict.get("targetWindow")
+        if not isinstance(tw, dict):
+            tw = {}
+        if self._tw_title_hint is not None:
+            self._tw_title_hint.setStringValue_(str(tw.get("titleHint") or "iPhone Mirroring"))
+        if self._tw_pid is not None:
+            pid = tw.get("pid")
+            self._tw_pid.setStringValue_(str(pid) if isinstance(pid, int) else "")
 
         g = self._cfg_dict.get("global")
         if not isinstance(g, dict):
@@ -641,6 +976,19 @@ class AppDelegate(NSObject):
     def _apply_ui_to_cfg(self) -> None:
         if not isinstance(self._cfg_dict, dict):
             return
+
+        tw = self._cfg_dict.get("targetWindow")
+        if not isinstance(tw, dict):
+            tw = {}
+            self._cfg_dict["targetWindow"] = tw
+        if self._tw_title_hint is not None:
+            tw["titleHint"] = str(self._tw_title_hint.stringValue()).strip() or "iPhone Mirroring"
+        if self._tw_pid is not None:
+            pid_s = str(self._tw_pid.stringValue()).strip()
+            try:
+                tw["pid"] = int(pid_s) if pid_s else None
+            except Exception:
+                tw["pid"] = None
 
         g = self._cfg_dict.get("global")
         if not isinstance(g, dict):
@@ -783,6 +1131,58 @@ class AppDelegate(NSObject):
             self._app.open_in_editor(self._cfg_path())
         except Exception as e:
             self._alert("打开失败", str(e))
+
+    def onShowLogs_(self, _sender) -> None:
+        try:
+            self._ensure_log_window()
+            self._log_window.makeKeyAndOrderFront_(None)
+        except Exception as e:
+            self._alert("打开日志失败", str(e))
+
+    def onOpenLogFile_(self, _sender) -> None:
+        try:
+            self._app.open_in_editor(self._app.log_path())
+        except Exception as e:
+            self._alert("打开失败", str(e))
+
+    def onClearLogs_(self, _sender) -> None:
+        try:
+            self._app.clear_logs()
+            self._update_log_window()
+        except Exception as e:
+            self._alert("清空失败", str(e))
+
+    def onToggleOverlay_(self, _sender) -> None:
+        enabled = bool(self._chk_overlay.state()) if self._chk_overlay is not None else False
+        try:
+            if enabled:
+                self._ensure_overlay()
+                self._update_overlay()
+            else:
+                if self._overlay is not None:
+                    self._overlay.hide()
+                self._overlay = None
+        except Exception as e:
+            self._alert("设置失败", str(e))
+
+    def onDetectFrontmost_(self, _sender) -> None:
+        try:
+            from mirroring_keymap.macos.window import get_frontmost_debug
+
+            info = get_frontmost_debug(max_windows=10)
+            pid = int(info.get("pid", -1))
+            name = str(info.get("name") or "")
+            wins = info.get("windows") if isinstance(info.get("windows"), list) else []
+            wins_s = "\n".join([f"- {w}" for w in wins]) if wins else "(无窗口标题/无法获取)"
+
+            self._alert("当前前台信息", f"应用：{name}\nPID：{pid}\n窗口标题：\n{wins_s}\n\n已填入到“目标窗口/PID”，请点击“保存配置”。")
+
+            if self._tw_pid is not None and pid > 0:
+                self._tw_pid.setStringValue_(str(pid))
+            if self._tw_title_hint is not None and wins:
+                self._tw_title_hint.setStringValue_(str(wins[0]))
+        except Exception as e:
+            self._alert("检测失败", str(e))
 
     def onStart_(self, _sender) -> None:
         try:
@@ -1099,12 +1499,21 @@ class AppDelegate(NSObject):
         mode_map = {"paused": "暂停", "battle": "战斗", "free": "自由鼠标"}
         mode_cn = mode_map.get(str(snap.get("mode") or ""), str(snap.get("mode") or ""))
 
+        hint = ""
+        if not bool(snap.get("mapping_enabled")):
+            hint = "提示：映射未启用，请勾选“启用映射”或按启用热键（默认 F8）。"
+        elif not bool(snap.get("target_active")):
+            hint = "提示：目标窗口未命中/不在前台，请在上方填写正确的“目标窗口关键字”或用“取前台”填入 PID。"
+        elif str(snap.get("mode")) != "battle":
+            hint = "提示：当前为自由鼠标模式（不会触发开火/开镜/自定义点击），请开启“视角锁定”（默认 CapsLock）。"
+
         txt = (
             "状态：运行中\n"
             f"配置文件：{snap.get('config')}\n"
             f"配置档：{snap.get('profile')}\n"
             f"模式：{mode_cn} | 目标窗口在前台：{yn(snap.get('target_active'))}\n"
-            f"启用映射：{yn(snap.get('mapping_enabled'))} | 视角锁定：{yn(snap.get('camera_lock'))} | 背包打开：{yn(snap.get('backpack_open'))}"
+            f"启用映射：{yn(snap.get('mapping_enabled'))} | 视角锁定：{yn(snap.get('camera_lock'))} | 背包打开：{yn(snap.get('backpack_open'))}\n"
+            f"{hint}"
         )
         self._lbl_status.setStringValue_(txt)
 
@@ -1112,5 +1521,16 @@ class AppDelegate(NSObject):
         try:
             self._chk_enabled.setState_(1 if snap.get("mapping_enabled") else 0)
             self._chk_camera.setState_(1 if snap.get("camera_lock") else 0)
+        except Exception:
+            pass
+
+        # 更新日志窗口与覆盖层
+        try:
+            self._update_log_window()
+        except Exception:
+            pass
+        try:
+            if self._overlay is not None:
+                self._update_overlay()
         except Exception:
             pass

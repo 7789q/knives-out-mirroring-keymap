@@ -101,6 +101,9 @@ class Engine:
 
         self._battle_cursor_snap: Optional[CursorSnapshot] = None
 
+        # 日志：避免在 tick 循环里刷屏，仅在变化时输出
+        self._last_target_active_logged: Optional[bool] = None
+
         self._stop_evt = threading.Event()
         self._thread = threading.Thread(target=self._run_loop, name="scheduler", daemon=True)
 
@@ -118,12 +121,15 @@ class Engine:
     # -------------------------
 
     def start(self) -> None:
+        self._log.info("Engine starting...")
         self._thread.start()
 
     def stop(self) -> None:
+        self._log.info("Engine stopping...")
         self._stop_evt.set()
         self._thread.join(timeout=1.0)
         self._safe_release_all()
+        self._log.info("Engine stopped.")
 
     def is_mapping_enabled(self) -> bool:
         with self._lock:
@@ -149,6 +155,7 @@ class Engine:
             if not self._mapping_enabled:
                 self._camera_lock = False
                 self._backpack_open = False
+        self._log.info("映射 %s", "启用" if enabled else "禁用")
         if not enabled:
             self._safe_release_all()
 
@@ -157,6 +164,7 @@ class Engine:
             self._mapping_enabled = False
             self._camera_lock = False
             self._backpack_open = False
+        self._log.warning("紧急停止：已禁用映射并请求释放所有按住")
         self._safe_release_all()
 
     def set_camera_lock(self, enabled: bool) -> None:
@@ -164,6 +172,7 @@ class Engine:
             self._camera_lock = bool(enabled)
             if self._camera_lock:
                 self._backpack_open = False
+        self._log.info("视角锁定 %s", "开启" if enabled else "关闭")
 
     def toggle_backpack(self) -> None:
         with self._lock:
@@ -178,6 +187,7 @@ class Engine:
                     rrand_px=self._cfg.global_.rrandDefaultPx,
                 )
             )
+        self._log.info("背包 %s", "打开" if opening else "关闭")
 
     # -------------------------
     # EventTap callback
@@ -241,9 +251,15 @@ class Engine:
                     self._log.info("背包 %s", "打开" if opening else "关闭")
                 else:
                     # 内置开火/开镜：若触发键是键盘，则在此处拦截并转为 Tap
-                    if mapping_enabled and target_active and mode == Mode.BATTLE:
-                        t_type, t_val = self._fire_trigger
-                        if t_type == "key" and kc == int(t_val):
+                    t_type, t_val = self._fire_trigger
+                    if t_type == "key" and kc == int(t_val):
+                        if not mapping_enabled:
+                            self._log.warning("开火被忽略：映射未启用")
+                        elif not target_active:
+                            self._log.warning("开火被忽略：目标窗口未在前台（请检查 titleHint/pid）")
+                        elif mode != Mode.BATTLE:
+                            self._log.warning("开火被忽略：当前模式=%s（需要战斗模式）", mode.value)
+                        else:
                             with self._lock:
                                 self._tap_queue.append(
                                     TapRequest(
@@ -253,10 +269,19 @@ class Engine:
                                         rrand_px=self._profile.fire.rrandPx,
                                     )
                                 )
+                            self._log.debug("enqueue tap: fire")
                             swallow = True
                             return True
-                        t_type, t_val = self._scope_trigger
-                        if t_type == "key" and kc == int(t_val):
+
+                    t_type, t_val = self._scope_trigger
+                    if t_type == "key" and kc == int(t_val):
+                        if not mapping_enabled:
+                            self._log.warning("开镜被忽略：映射未启用")
+                        elif not target_active:
+                            self._log.warning("开镜被忽略：目标窗口未在前台（请检查 titleHint/pid）")
+                        elif mode != Mode.BATTLE:
+                            self._log.warning("开镜被忽略：当前模式=%s（需要战斗模式）", mode.value)
+                        else:
                             with self._lock:
                                 self._tap_queue.append(
                                     TapRequest(
@@ -266,32 +291,36 @@ class Engine:
                                         rrand_px=self._profile.scope.rrandPx,
                                     )
                                 )
+                            self._log.debug("enqueue tap: scope")
                             swallow = True
                             return True
 
-                    # 自定义映射：仅战斗态生效
-                    if (
-                        event_type == Quartz.kCGEventKeyDown
-                        and mapping_enabled
-                        and target_active
-                        and mode == Mode.BATTLE
-                        and kc in self._custom_by_keycode
-                    ):
+                    # 自定义映射（按键→点击）
+                    if event_type == Quartz.kCGEventKeyDown and kc in self._custom_by_keycode:
                         m = self._custom_by_keycode[kc]
-                        with self._lock:
-                            self._tap_queue.append(
-                                TapRequest(
-                                    name=f"custom:{m.name}",
-                                    point=m.point,
-                                    hold_ms=m.tapHoldMs,
-                                    rrand_px=m.rrandPx,
+                        if not mapping_enabled:
+                            self._log.warning("自定义点击「%s」被忽略：映射未启用", m.name)
+                        elif not target_active:
+                            self._log.warning("自定义点击「%s」被忽略：目标窗口未在前台（请检查 titleHint/pid）", m.name)
+                        elif mode != Mode.BATTLE:
+                            self._log.warning("自定义点击「%s」被忽略：当前模式=%s（需要战斗模式）", m.name, mode.value)
+                        else:
+                            with self._lock:
+                                self._tap_queue.append(
+                                    TapRequest(
+                                        name=f"custom:{m.name}",
+                                        point=m.point,
+                                        hold_ms=m.tapHoldMs,
+                                        rrand_px=m.rrandPx,
+                                    )
                                 )
-                            )
+                            self._log.debug("enqueue tap: custom:%s", m.name)
 
             # CapsLock 使用 flagsChanged 更可靠
             if event_type == Quartz.kCGEventFlagsChanged and kc == self._kc_caps and mapping_enabled and target_active:
                 with self._lock:
                     self._camera_lock = not self._camera_lock
+                    self._log.info("视角锁定 %s", "开启" if self._camera_lock else "关闭")
                     if self._camera_lock:
                         self._backpack_open = False
                 self._log.info("视角锁定 %s", "开启" if self._camera_lock else "关闭")
@@ -325,6 +354,7 @@ class Engine:
                                     rrand_px=self._profile.fire.rrandPx,
                                 )
                             )
+                        self._log.debug("enqueue tap: fire (mouse)")
                         swallow = True
                     if t_val == "right" and event_type == Quartz.kCGEventRightMouseDown:
                         with self._lock:
@@ -336,6 +366,7 @@ class Engine:
                                     rrand_px=self._profile.fire.rrandPx,
                                 )
                             )
+                        self._log.debug("enqueue tap: fire (mouse)")
                         swallow = True
 
                 t_type, t_val = self._scope_trigger
@@ -350,6 +381,7 @@ class Engine:
                                     rrand_px=self._profile.scope.rrandPx,
                                 )
                             )
+                        self._log.debug("enqueue tap: scope (mouse)")
                         swallow = True
                     if t_val == "right" and event_type == Quartz.kCGEventRightMouseDown:
                         with self._lock:
@@ -361,6 +393,7 @@ class Engine:
                                     rrand_px=self._profile.scope.rrandPx,
                                 )
                             )
+                        self._log.debug("enqueue tap: scope (mouse)")
                         swallow = True
 
         elif event_type == Quartz.kCGEventScrollWheel:
@@ -414,6 +447,9 @@ class Engine:
             with self._lock:
                 self._target_active = active
                 self._target_check_ts = now
+            if self._last_target_active_logged is None or self._last_target_active_logged != active:
+                self._last_target_active_logged = active
+                self._log.info("目标窗口在前台：%s", "是" if active else "否")
 
         with self._lock:
             mapping_enabled = self._mapping_enabled
@@ -599,6 +635,10 @@ class Engine:
         if r is None:
             r = self._cfg.global_.rrandDefaultPx
         p2 = random_point(p, float(r or 0.0), rng=self._rng)
+        if req.name == "backpack" or req.name.startswith("custom:"):
+            self._log.info("点击: %s @ (%.1f, %.1f)", req.name, p2[0], p2[1])
+        else:
+            self._log.debug("tap: %s @ (%.1f, %.1f)", req.name, p2[0], p2[1])
         try:
             self._inj.tap(p2, hold_ms=req.hold_ms)
         finally:
