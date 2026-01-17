@@ -30,10 +30,14 @@ from AppKit import (
     NSRunningApplication,
     NSScreen,
     NSScrollView,
+    NSTabView,
+    NSTabViewItem,
     NSTextField,
     NSTextView,
     NSTimer,
     NSView,
+    NSViewHeightSizable,
+    NSViewWidthSizable,
     NSWindow,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorFullScreenAuxiliary,
@@ -291,6 +295,7 @@ class AppDelegate(NSObject):
 
         # 点位标记覆盖层
         self._overlay = None
+        self._tab = None
 
         # 记录配置文件 mtime，用于提示“外部修改未生效/需要重载”
         self._cfg_mtime = None
@@ -487,14 +492,40 @@ class AppDelegate(NSObject):
         content.addSubview_(self._lbl_pick)
 
         # --------------------
-        # 左侧：点位 + 参数（选中 profile）
-        # --------------------
-        xL = 20
-        xR = 435
+        # 分页设置：把“点位/参数/按键/自定义”按类别分开，避免挤在同一屏；
+        # 同时每页使用 ScrollView，窗口缩小后仍可滚动查看全部设置。
+        self._tab = NSTabView.alloc().initWithFrame_(NSMakeRect(20, 70, 870, 355))
+        self._tab.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+        content.addSubview_(self._tab)
 
-        content.addSubview_(_label("关键点位（屏幕坐标）", xL, 390, 200))
-        content.addSubview_(_label("X", xL + 90, 370, 100))
-        content.addSubview_(_label("Y", xL + 200, 370, 100))
+        def _make_scroll(doc_w: float, doc_h: float):
+            scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(0, 0, 870, 355))
+            scroll.setHasVerticalScroller_(True)
+            scroll.setHasHorizontalScroller_(True)
+            try:
+                scroll.setAutohidesScrollers_(True)
+            except Exception:
+                pass
+            doc = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, doc_w, doc_h))
+            scroll.setDocumentView_(doc)
+            scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            return scroll, doc
+
+        def _add_tab(identifier: str, title: str, doc_w: float, doc_h: float):
+            scroll, doc = _make_scroll(doc_w, doc_h)
+            item = NSTabViewItem.alloc().initWithIdentifier_(identifier)
+            item.setLabel_(title)
+            item.setView_(scroll)
+            self._tab.addTabViewItem_(item)
+            return doc
+
+        # --------------------
+        # Tab 1: 点位
+        # --------------------
+        doc_points = _add_tab("points", "点位", 860, 360)
+        doc_points.addSubview_(_label("关键点位（屏幕全局坐标）", 20, 325, 300))
+        doc_points.addSubview_(_label("X", 170, 295, 20))
+        doc_points.addSubview_(_label("Y", 290, 295, 20))
 
         self._point_fields = {}
         point_defs = [
@@ -505,167 +536,196 @@ class AppDelegate(NSObject):
             ("backpack", "背包按钮"),
         ]
         for idx, (key, label) in enumerate(point_defs):
-            y = 330 - idx * 30
-            content.addSubview_(_label(label, xL, y + 2, 80))
-            fx = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 90, y, 100, 24))
-            fy = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 200, y, 100, 24))
-            content.addSubview_(fx)
-            content.addSubview_(fy)
-            btn_fill = NSButton.alloc().initWithFrame_(NSMakeRect(xL + 310, y - 1, 80, 26))
+            y = 255 - idx * 42
+            doc_points.addSubview_(_label(label, 20, y + 2, 120))
+            fx = NSTextField.alloc().initWithFrame_(NSMakeRect(160, y, 110, 24))
+            fy = NSTextField.alloc().initWithFrame_(NSMakeRect(280, y, 110, 24))
+            doc_points.addSubview_(fx)
+            doc_points.addSubview_(fy)
+            btn_fill = NSButton.alloc().initWithFrame_(NSMakeRect(405, y - 1, 100, 26))
             btn_fill.setTitle_("填入取点")
             btn_fill.setBezelStyle_(NSBezelStyleRounded)
             btn_fill.setTag_(idx)
             btn_fill.setTarget_(self)
             btn_fill.setAction_("onFillPoint:")
-            content.addSubview_(btn_fill)
+            doc_points.addSubview_(btn_fill)
             self._point_fields[key] = (fx, fy)
 
-        content.addSubview_(_label("手感参数（当前配置档）", xL, 190, 200))
+        doc_points.addSubview_(
+            _label("提示：先点“取点”，再点每行的“填入取点”。坐标是屏幕全局坐标（非窗口相对）。", 20, 20, 820)
+        )
 
-        content.addSubview_(_label("摇杆半径", xL, 155, 80))
-        self._joy_radius = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 80, 150, 80, 24))
-        content.addSubview_(self._joy_radius)
+        # --------------------
+        # Tab 2: 参数
+        # --------------------
+        doc_params = _add_tab("params", "参数", 860, 440)
+        doc_params.addSubview_(_label("手感参数（当前配置档）", 20, 405, 240))
 
-        content.addSubview_(_label("视角灵敏度", xL + 170, 155, 90))
-        self._cam_sens = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 260, 150, 70, 24))
-        content.addSubview_(self._cam_sens)
+        doc_params.addSubview_(_label("摇杆半径(px)", 20, 365, 90))
+        self._joy_radius = NSTextField.alloc().initWithFrame_(NSMakeRect(115, 360, 90, 24))
+        doc_params.addSubview_(self._joy_radius)
 
-        self._cam_invert = NSButton.alloc().initWithFrame_(NSMakeRect(xL + 340, 150, 120, 24))
+        doc_params.addSubview_(_label("视角灵敏度", 235, 365, 80))
+        self._cam_sens = NSTextField.alloc().initWithFrame_(NSMakeRect(315, 360, 70, 24))
+        doc_params.addSubview_(self._cam_sens)
+
+        self._cam_invert = NSButton.alloc().initWithFrame_(NSMakeRect(405, 360, 120, 24))
         self._cam_invert.setButtonType_(NSButtonTypeSwitch)
         self._cam_invert.setTitle_("反转Y")
-        content.addSubview_(self._cam_invert)
+        doc_params.addSubview_(self._cam_invert)
 
-        content.addSubview_(_label("Tcam", xL, 125, 40))
-        self._cam_tcam = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 40, 120, 60, 24))
-        content.addSubview_(self._cam_tcam)
-        content.addSubview_(_label("视角半径", xL + 110, 125, 60))
-        self._cam_radius = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 170, 120, 60, 24))
-        content.addSubview_(self._cam_radius)
+        doc_params.addSubview_(_label("Tcam(px)", 20, 330, 70))
+        self._cam_tcam = NSTextField.alloc().initWithFrame_(NSMakeRect(90, 325, 70, 24))
+        doc_params.addSubview_(self._cam_tcam)
 
-        self._wheel_enabled = NSButton.alloc().initWithFrame_(NSMakeRect(xL, 90, 90, 24))
+        doc_params.addSubview_(_label("视角半径(px)", 180, 330, 90))
+        self._cam_radius = NSTextField.alloc().initWithFrame_(NSMakeRect(270, 325, 70, 24))
+        doc_params.addSubview_(self._cam_radius)
+
+        doc_params.addSubview_(_label("滚轮映射", 20, 285, 70))
+        self._wheel_enabled = NSButton.alloc().initWithFrame_(NSMakeRect(90, 280, 90, 24))
         self._wheel_enabled.setButtonType_(NSButtonTypeSwitch)
-        self._wheel_enabled.setTitle_("滚轮映射")
-        content.addSubview_(self._wheel_enabled)
-        content.addSubview_(_label("D", xL + 95, 95, 12))
-        self._wheel_d = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 110, 90, 45, 24))
-        content.addSubview_(self._wheel_d)
-        content.addSubview_(_label("停(ms)", xL + 158, 95, 45))
-        self._wheel_stop = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 205, 90, 50, 24))
-        content.addSubview_(self._wheel_stop)
-        content.addSubview_(_label("锚X", xL + 260, 95, 30))
-        self._wheel_anchor_x = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 292, 90, 50, 24))
-        content.addSubview_(self._wheel_anchor_x)
-        content.addSubview_(_label("Y", xL + 345, 95, 12))
-        self._wheel_anchor_y = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 359, 90, 50, 24))
-        content.addSubview_(self._wheel_anchor_y)
+        self._wheel_enabled.setTitle_("启用")
+        doc_params.addSubview_(self._wheel_enabled)
 
-        content.addSubview_(_label("调度Hz", xL, 65, 45))
-        self._sched_tick = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 45, 60, 45, 24))
-        content.addSubview_(self._sched_tick)
-        content.addSubview_(_label("视角Hz", xL + 100, 65, 50))
-        self._sched_cam_min = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 145, 60, 45, 24))
-        content.addSubview_(self._sched_cam_min)
-        content.addSubview_(_label("摇杆Hz", xL + 200, 65, 50))
-        self._sched_joy_min = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 245, 60, 45, 24))
-        content.addSubview_(self._sched_joy_min)
-        content.addSubview_(_label("步长px", xL + 300, 65, 50))
-        self._sched_max_step = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 350, 60, 45, 24))
-        content.addSubview_(self._sched_max_step)
+        doc_params.addSubview_(_label("D", 190, 285, 12))
+        self._wheel_d = NSTextField.alloc().initWithFrame_(NSMakeRect(205, 280, 55, 24))
+        doc_params.addSubview_(self._wheel_d)
+
+        doc_params.addSubview_(_label("停(ms)", 270, 285, 45))
+        self._wheel_stop = NSTextField.alloc().initWithFrame_(NSMakeRect(315, 280, 60, 24))
+        doc_params.addSubview_(self._wheel_stop)
+
+        doc_params.addSubview_(_label("锚X", 390, 285, 30))
+        self._wheel_anchor_x = NSTextField.alloc().initWithFrame_(NSMakeRect(420, 280, 70, 24))
+        doc_params.addSubview_(self._wheel_anchor_x)
+
+        doc_params.addSubview_(_label("Y", 500, 285, 12))
+        self._wheel_anchor_y = NSTextField.alloc().initWithFrame_(NSMakeRect(515, 280, 70, 24))
+        doc_params.addSubview_(self._wheel_anchor_y)
+
+        doc_params.addSubview_(
+            _label("规则：战斗态=以锚点上下拖动；自由鼠标=以鼠标当前位置上下拖动。", 20, 250, 820)
+        )
+
+        doc_params.addSubview_(_label("调度参数", 20, 205, 70))
+        doc_params.addSubview_(_label("调度Hz", 20, 175, 45))
+        self._sched_tick = NSTextField.alloc().initWithFrame_(NSMakeRect(65, 170, 55, 24))
+        doc_params.addSubview_(self._sched_tick)
+
+        doc_params.addSubview_(_label("视角Hz", 140, 175, 50))
+        self._sched_cam_min = NSTextField.alloc().initWithFrame_(NSMakeRect(190, 170, 55, 24))
+        doc_params.addSubview_(self._sched_cam_min)
+
+        doc_params.addSubview_(_label("摇杆Hz", 265, 175, 50))
+        self._sched_joy_min = NSTextField.alloc().initWithFrame_(NSMakeRect(315, 170, 55, 24))
+        doc_params.addSubview_(self._sched_joy_min)
+
+        doc_params.addSubview_(_label("步长px", 390, 175, 50))
+        self._sched_max_step = NSTextField.alloc().initWithFrame_(NSMakeRect(440, 170, 70, 24))
+        doc_params.addSubview_(self._sched_max_step)
 
         # --------------------
-        # 右侧：全局设置 + 自定义点击
+        # Tab 3: 按键
         # --------------------
-        content.addSubview_(_label("按键设置（全局）", xR, 390, 200))
+        doc_keys = _add_tab("keys", "按键", 860, 360)
+        doc_keys.addSubview_(_label("按键设置（全局）", 20, 325, 200))
 
-        # 第一行：启用/紧急/开火/开镜
-        content.addSubview_(_label("启用热键", xR, 355, 60))
-        self._global_enable_hotkey = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 60, 350, 50, 24))
-        content.addSubview_(self._global_enable_hotkey)
-        content.addSubview_(_label("紧急热键", xR + 120, 355, 60))
-        self._global_panic_hotkey = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 180, 350, 50, 24))
-        content.addSubview_(self._global_panic_hotkey)
-        content.addSubview_(_label("开火键", xR + 240, 355, 45))
-        self._global_fire_key = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 285, 350, 70, 24))
-        content.addSubview_(self._global_fire_key)
-        content.addSubview_(_label("开镜键", xR + 360, 355, 45))
-        self._global_scope_key = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 405, 350, 70, 24))
-        content.addSubview_(self._global_scope_key)
+        doc_keys.addSubview_(_label("启用热键", 20, 285, 60))
+        self._global_enable_hotkey = NSTextField.alloc().initWithFrame_(NSMakeRect(80, 280, 70, 24))
+        doc_keys.addSubview_(self._global_enable_hotkey)
 
-        # 第二行：视角/背包/移动
-        content.addSubview_(_label("视角键", xR, 325, 45))
-        self._global_camera_lock_key = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 45, 320, 70, 24))
-        content.addSubview_(self._global_camera_lock_key)
-        content.addSubview_(_label("背包键", xR + 120, 325, 45))
-        self._global_backpack_key = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 165, 320, 70, 24))
-        content.addSubview_(self._global_backpack_key)
-        content.addSubview_(_label("移动", xR + 240, 325, 30))
-        content.addSubview_(_label("上", xR + 270, 325, 15))
-        self._global_move_up_key = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 285, 320, 35, 24))
-        content.addSubview_(self._global_move_up_key)
-        content.addSubview_(_label("下", xR + 325, 325, 15))
-        self._global_move_down_key = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 340, 320, 35, 24))
-        content.addSubview_(self._global_move_down_key)
-        content.addSubview_(_label("左", xR + 380, 325, 15))
-        self._global_move_left_key = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 395, 320, 35, 24))
-        content.addSubview_(self._global_move_left_key)
-        content.addSubview_(_label("右", xR + 435, 325, 15))
-        self._global_move_right_key = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 450, 320, 35, 24))
-        content.addSubview_(self._global_move_right_key)
+        doc_keys.addSubview_(_label("紧急热键", 170, 285, 60))
+        self._global_panic_hotkey = NSTextField.alloc().initWithFrame_(NSMakeRect(230, 280, 70, 24))
+        doc_keys.addSubview_(self._global_panic_hotkey)
 
-        # 第三行：随机半径默认值
-        content.addSubview_(_label("随机半径(px)", xR, 295, 80))
-        self._global_rrand_default = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 80, 290, 60, 24))
-        content.addSubview_(self._global_rrand_default)
+        doc_keys.addSubview_(_label("开火键", 320, 285, 45))
+        self._global_fire_key = NSTextField.alloc().initWithFrame_(NSMakeRect(365, 280, 90, 24))
+        doc_keys.addSubview_(self._global_fire_key)
 
-        # 自定义点击
-        content.addSubview_(_label("自定义点击（按键→点击）", xR, 260, 200))
+        doc_keys.addSubview_(_label("开镜键", 470, 285, 45))
+        self._global_scope_key = NSTextField.alloc().initWithFrame_(NSMakeRect(515, 280, 90, 24))
+        doc_keys.addSubview_(self._global_scope_key)
 
-        content.addSubview_(_label("名称", xR, 235, 40))
-        self._custom_name = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 40, 230, 160, 24))
-        content.addSubview_(self._custom_name)
-        content.addSubview_(_label("键", xR + 210, 235, 20))
-        self._custom_key = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 230, 230, 80, 24))
-        content.addSubview_(self._custom_key)
+        doc_keys.addSubview_(_label("视角锁定键", 20, 245, 80))
+        self._global_camera_lock_key = NSTextField.alloc().initWithFrame_(NSMakeRect(100, 240, 90, 24))
+        doc_keys.addSubview_(self._global_camera_lock_key)
 
-        content.addSubview_(_label("X", xR, 205, 15))
-        self._custom_x = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 15, 200, 70, 24))
-        content.addSubview_(self._custom_x)
-        content.addSubview_(_label("Y", xR + 90, 205, 15))
-        self._custom_y = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 105, 200, 70, 24))
-        content.addSubview_(self._custom_y)
-        content.addSubview_(_label("按压(ms)", xR + 180, 205, 55))
-        self._custom_hold = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 235, 200, 55, 24))
-        content.addSubview_(self._custom_hold)
-        content.addSubview_(_label("随机(px)", xR + 295, 205, 50))
-        self._custom_rrand = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 335, 200, 55, 24))
-        content.addSubview_(self._custom_rrand)
+        doc_keys.addSubview_(_label("背包键", 210, 245, 45))
+        self._global_backpack_key = NSTextField.alloc().initWithFrame_(NSMakeRect(255, 240, 90, 24))
+        doc_keys.addSubview_(self._global_backpack_key)
 
-        btn_add = NSButton.alloc().initWithFrame_(NSMakeRect(xR + 320, 229, 120, 26))
+        doc_keys.addSubview_(_label("移动(上/下/左/右)", 20, 205, 110))
+        self._global_move_up_key = NSTextField.alloc().initWithFrame_(NSMakeRect(135, 200, 40, 24))
+        self._global_move_down_key = NSTextField.alloc().initWithFrame_(NSMakeRect(185, 200, 40, 24))
+        self._global_move_left_key = NSTextField.alloc().initWithFrame_(NSMakeRect(235, 200, 40, 24))
+        self._global_move_right_key = NSTextField.alloc().initWithFrame_(NSMakeRect(285, 200, 40, 24))
+        doc_keys.addSubview_(self._global_move_up_key)
+        doc_keys.addSubview_(self._global_move_down_key)
+        doc_keys.addSubview_(self._global_move_left_key)
+        doc_keys.addSubview_(self._global_move_right_key)
+
+        doc_keys.addSubview_(_label("随机半径默认(px)", 20, 165, 100))
+        self._global_rrand_default = NSTextField.alloc().initWithFrame_(NSMakeRect(120, 160, 70, 24))
+        doc_keys.addSubview_(self._global_rrand_default)
+
+        doc_keys.addSubview_(_label("提示：MouseLeft/MouseRight 表示鼠标左右键。", 20, 20, 820))
+
+        # --------------------
+        # Tab 4: 自定义
+        # --------------------
+        doc_custom = _add_tab("custom", "自定义", 860, 420)
+        doc_custom.addSubview_(_label("自定义点击（按键→点击）", 20, 385, 240))
+
+        doc_custom.addSubview_(_label("名称", 20, 345, 40))
+        self._custom_name = NSTextField.alloc().initWithFrame_(NSMakeRect(60, 340, 220, 24))
+        doc_custom.addSubview_(self._custom_name)
+
+        doc_custom.addSubview_(_label("键", 295, 345, 20))
+        self._custom_key = NSTextField.alloc().initWithFrame_(NSMakeRect(315, 340, 90, 24))
+        doc_custom.addSubview_(self._custom_key)
+
+        btn_add = NSButton.alloc().initWithFrame_(NSMakeRect(420, 339, 120, 26))
         btn_add.setTitle_("添加/替换")
         btn_add.setBezelStyle_(NSBezelStyleRounded)
         btn_add.setTarget_(self)
         btn_add.setAction_("onAddCustom:")
-        content.addSubview_(btn_add)
+        doc_custom.addSubview_(btn_add)
 
-        content.addSubview_(_label("删除编号", xR, 170, 60))
-        self._custom_remove_index = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 60, 165, 60, 24))
-        content.addSubview_(self._custom_remove_index)
-        btn_remove = NSButton.alloc().initWithFrame_(NSMakeRect(xR + 130, 164, 80, 26))
+        doc_custom.addSubview_(_label("X", 20, 305, 12))
+        self._custom_x = NSTextField.alloc().initWithFrame_(NSMakeRect(35, 300, 80, 24))
+        doc_custom.addSubview_(self._custom_x)
+        doc_custom.addSubview_(_label("Y", 125, 305, 12))
+        self._custom_y = NSTextField.alloc().initWithFrame_(NSMakeRect(140, 300, 80, 24))
+        doc_custom.addSubview_(self._custom_y)
+
+        doc_custom.addSubview_(_label("按压(ms)", 235, 305, 55))
+        self._custom_hold = NSTextField.alloc().initWithFrame_(NSMakeRect(290, 300, 70, 24))
+        doc_custom.addSubview_(self._custom_hold)
+
+        doc_custom.addSubview_(_label("随机(px)", 375, 305, 50))
+        self._custom_rrand = NSTextField.alloc().initWithFrame_(NSMakeRect(425, 300, 70, 24))
+        doc_custom.addSubview_(self._custom_rrand)
+
+        doc_custom.addSubview_(_label("删除编号(1-based)", 20, 265, 95))
+        self._custom_remove_index = NSTextField.alloc().initWithFrame_(NSMakeRect(115, 260, 60, 24))
+        doc_custom.addSubview_(self._custom_remove_index)
+        btn_remove = NSButton.alloc().initWithFrame_(NSMakeRect(185, 259, 80, 26))
         btn_remove.setTitle_("删除")
         btn_remove.setBezelStyle_(NSBezelStyleRounded)
         btn_remove.setTarget_(self)
         btn_remove.setAction_("onRemoveCustom:")
-        content.addSubview_(btn_remove)
+        doc_custom.addSubview_(btn_remove)
 
-        content.addSubview_(_label("当前自定义点击：", xR, 140, 120))
-        self._custom_list = NSTextField.alloc().initWithFrame_(NSMakeRect(xR, 70, 420, 70))
+        doc_custom.addSubview_(_label("当前自定义点击：", 20, 235, 120))
+        self._custom_list = NSTextField.alloc().initWithFrame_(NSMakeRect(20, 40, 820, 185))
         self._custom_list.setEditable_(False)
         self._custom_list.setBordered_(True)
         self._custom_list.setDrawsBackground_(True)
         self._custom_list.setUsesSingleLineMode_(False)
         self._custom_list.setLineBreakMode_(0)
         self._custom_list.setStringValue_("(空)")
-        content.addSubview_(self._custom_list)
+        doc_custom.addSubview_(self._custom_list)
 
         # status（底部）
         self._lbl_status = NSTextField.alloc().initWithFrame_(NSMakeRect(20, 10, 870, 50))
