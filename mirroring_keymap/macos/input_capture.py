@@ -29,6 +29,7 @@ class InputCapture:
         self._ignore_tag = ignore_user_data_tag
         self._log = logger or logging.getLogger(__name__)
         self._handle: Optional[TapHandle] = None
+        self._active: bool = False
 
     def start(self) -> None:
         require_macos()
@@ -58,6 +59,9 @@ class InputCapture:
                 Quartz.kCGEventTapDisabledByTimeout,
                 Quartz.kCGEventTapDisabledByUserInput,
             ):
+                # stop() 后仍可能收到一次 disable 回调；此时不要误报/重启。
+                if not self._active or self._handle is None:
+                    return event
                 self._log.warning("EventTap disabled (%s). Re-enabling...", event_type)
                 try:
                     Quartz.CGEventTapEnable(self._handle.tap, True)  # type: ignore[union-attr]
@@ -100,6 +104,7 @@ class InputCapture:
         Quartz.CGEventTapEnable(tap, True)
 
         self._handle = TapHandle(tap=tap, run_loop_source=src)
+        self._active = True
         self._log.info("InputCapture started.")
 
     def stop(self) -> None:
@@ -108,10 +113,10 @@ class InputCapture:
 
         if self._handle is None:
             return
+        self._active = False
         try:
             Quartz.CGEventTapEnable(self._handle.tap, False)
         except Exception:
             pass
         self._handle = None
         self._log.info("InputCapture stopped.")
-
