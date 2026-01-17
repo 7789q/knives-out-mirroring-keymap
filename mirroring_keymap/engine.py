@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import random
 import threading
 import time
@@ -13,7 +14,7 @@ from .config import AppConfig, CustomMapping, Point, ProfileConfig
 from .mathutil import add, normalize, random_point, scale
 from .macos.injector import CursorSnapshot, Injector
 from .macos.keycodes import keycode_for
-from .macos.window import is_target_frontmost
+from .macos.window import get_frontmost, is_target_frontmost
 
 
 class Mode(str, Enum):
@@ -529,7 +530,14 @@ class Engine:
         # 目标窗口检查不需要每 tick 都做
         if now - self._target_check_ts >= 0.2:
             if not self._target_check_enabled:
+                # 不检测目标窗口时：默认对所有前台应用生效。
+                # 但为了让 UI 可用，当前台是本程序时自动暂停映射（否则鼠标点击会被重映射，导致无法操作 UI）。
                 active = True
+                try:
+                    if get_frontmost().pid == os.getpid():
+                        active = False
+                except Exception:
+                    pass
             else:
                 active = False
                 try:
