@@ -241,6 +241,8 @@ class AppDelegate(NSObject):
         self._wheel_enabled = None
         self._wheel_d = None
         self._wheel_stop = None
+        self._wheel_anchor_x = None
+        self._wheel_anchor_y = None
 
         self._sched_tick = None
         self._sched_cam_min = None
@@ -260,6 +262,7 @@ class AppDelegate(NSObject):
         self._tw_title_hint = None
         self._tw_pid = None
         self._btn_tw_detect = None
+        self._tw_disable = None
 
         # 日志窗口
         self._log_window = None
@@ -454,6 +457,11 @@ class AppDelegate(NSObject):
         self._btn_tw_detect.setAction_("onDetectFrontmost:")
         content.addSubview_(self._btn_tw_detect)
 
+        self._tw_disable = NSButton.alloc().initWithFrame_(NSMakeRect(435, 472, 300, 24))
+        self._tw_disable.setButtonType_(NSButtonTypeSwitch)
+        self._tw_disable.setTitle_("不检测目标窗口（启用映射时始终生效）")
+        content.addSubview_(self._tw_disable)
+
         # pick point
         btn_pick = NSButton.alloc().initWithFrame_(NSMakeRect(20, 435, 120, 28))
         btn_pick.setTitle_("取点（点击）")
@@ -525,16 +533,22 @@ class AppDelegate(NSObject):
         self._cam_radius = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 170, 120, 60, 24))
         content.addSubview_(self._cam_radius)
 
-        self._wheel_enabled = NSButton.alloc().initWithFrame_(NSMakeRect(xL, 90, 120, 24))
+        self._wheel_enabled = NSButton.alloc().initWithFrame_(NSMakeRect(xL, 90, 90, 24))
         self._wheel_enabled.setButtonType_(NSButtonTypeSwitch)
         self._wheel_enabled.setTitle_("滚轮映射")
         content.addSubview_(self._wheel_enabled)
-        content.addSubview_(_label("D", xL + 120, 95, 20))
-        self._wheel_d = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 140, 90, 60, 24))
+        content.addSubview_(_label("D", xL + 95, 95, 12))
+        self._wheel_d = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 110, 90, 45, 24))
         content.addSubview_(self._wheel_d)
-        content.addSubview_(_label("停止(ms)", xL + 210, 95, 60))
-        self._wheel_stop = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 270, 90, 70, 24))
+        content.addSubview_(_label("停(ms)", xL + 158, 95, 45))
+        self._wheel_stop = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 205, 90, 50, 24))
         content.addSubview_(self._wheel_stop)
+        content.addSubview_(_label("锚X", xL + 260, 95, 30))
+        self._wheel_anchor_x = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 292, 90, 50, 24))
+        content.addSubview_(self._wheel_anchor_x)
+        content.addSubview_(_label("Y", xL + 345, 95, 12))
+        self._wheel_anchor_y = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 359, 90, 50, 24))
+        content.addSubview_(self._wheel_anchor_y)
 
         content.addSubview_(_label("调度Hz", xL, 65, 45))
         self._sched_tick = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 45, 60, 45, 24))
@@ -788,6 +802,27 @@ class AppDelegate(NSObject):
             color, label = color_map.get(k, (NSColor.systemGrayColor(), k))
             markers.append({"x": x, "y": y, "r": 7.0, "color": color, "label": label})
 
+        # 滚轮锚点（锁定视角/战斗模式下使用）
+        p = self._profile_dict(self._selected_profile())
+        if isinstance(p, dict):
+            wheel = p.get("wheel") if isinstance(p.get("wheel"), dict) else {}
+            ap = wheel.get("anchorPoint")
+            if ap is None:
+                ap = wheel.get("anchor")
+            if isinstance(ap, (list, tuple)) and len(ap) == 2:
+                try:
+                    markers.append(
+                        {
+                            "x": float(ap[0]),
+                            "y": float(ap[1]),
+                            "r": 7.0,
+                            "color": NSColor.systemYellowColor(),
+                            "label": "滚轮锚点",
+                        }
+                    )
+                except Exception:
+                    pass
+
         # 自定义点击：从配置里读取（已保存为准）
         if isinstance(self._cfg_dict, dict):
             lst = self._cfg_dict.get("customMappings")
@@ -881,6 +916,10 @@ class AppDelegate(NSObject):
         if self._tw_pid is not None:
             pid = tw.get("pid")
             self._tw_pid.setStringValue_(str(pid) if isinstance(pid, int) else "")
+        if self._tw_disable is not None:
+            enabled = tw.get("enabled")
+            enabled_b = bool(enabled) if enabled is not None else True
+            self._tw_disable.setState_(1 if not enabled_b else 0)
 
         g = self._cfg_dict.get("global")
         if not isinstance(g, dict):
@@ -960,6 +999,16 @@ class AppDelegate(NSObject):
             self._wheel_d.setStringValue_(str(wheel.get("dPx") if wheel.get("dPx") is not None else 8))
         if self._wheel_stop is not None:
             self._wheel_stop.setStringValue_(str(wheel.get("stopMs") if wheel.get("stopMs") is not None else 120))
+        if self._wheel_anchor_x is not None and self._wheel_anchor_y is not None:
+            ap = wheel.get("anchorPoint")
+            if ap is None:
+                ap = wheel.get("anchor")
+            if isinstance(ap, (list, tuple)) and len(ap) == 2:
+                self._wheel_anchor_x.setStringValue_(str(ap[0]))
+                self._wheel_anchor_y.setStringValue_(str(ap[1]))
+            else:
+                self._wheel_anchor_x.setStringValue_("")
+                self._wheel_anchor_y.setStringValue_("")
 
         if self._sched_tick is not None:
             self._sched_tick.setStringValue_(str(sched.get("tickHz") if sched.get("tickHz") is not None else 120))
@@ -989,6 +1038,8 @@ class AppDelegate(NSObject):
                 tw["pid"] = int(pid_s) if pid_s else None
             except Exception:
                 tw["pid"] = None
+        if self._tw_disable is not None:
+            tw["enabled"] = False if bool(self._tw_disable.state()) else True
 
         g = self._cfg_dict.get("global")
         if not isinstance(g, dict):
@@ -1069,6 +1120,18 @@ class AppDelegate(NSObject):
             wheel["dPx"] = self._safe_float(self._wheel_d, 8.0)
         if self._wheel_stop is not None:
             wheel["stopMs"] = self._safe_int(self._wheel_stop, 120)
+        if self._wheel_anchor_x is not None and self._wheel_anchor_y is not None:
+            x_s = str(self._wheel_anchor_x.stringValue()).strip()
+            y_s = str(self._wheel_anchor_y.stringValue()).strip()
+            if x_s and y_s:
+                try:
+                    wheel["anchorPoint"] = [float(x_s), float(y_s)]
+                except Exception:
+                    wheel.pop("anchorPoint", None)
+            else:
+                wheel.pop("anchorPoint", None)
+            # 兼容旧字段名
+            wheel.pop("anchor", None)
 
         if self._sched_tick is not None:
             sched["tickHz"] = self._safe_int(self._sched_tick, 120)
@@ -1499,10 +1562,15 @@ class AppDelegate(NSObject):
         mode_map = {"paused": "暂停", "battle": "战斗", "free": "自由鼠标"}
         mode_cn = mode_map.get(str(snap.get("mode") or ""), str(snap.get("mode") or ""))
 
+        target_check_enabled = bool(snap.get("target_check_enabled") if snap.get("target_check_enabled") is not None else True)
+        target_line = (
+            f"目标窗口在前台：{yn(snap.get('target_active'))}" if target_check_enabled else "目标窗口检测：关闭"
+        )
+
         hint = ""
         if not bool(snap.get("mapping_enabled")):
             hint = "提示：映射未启用，请勾选“启用映射”或按启用热键（默认 F8）。"
-        elif not bool(snap.get("target_active")):
+        elif target_check_enabled and not bool(snap.get("target_active")):
             hint = "提示：目标窗口未命中/不在前台，请在上方填写正确的“目标窗口关键字”或用“取前台”填入 PID。"
         elif str(snap.get("mode")) != "battle":
             hint = "提示：当前为自由鼠标模式（不会触发开火/开镜/自定义点击），请开启“视角锁定”（默认 CapsLock）。"
@@ -1511,7 +1579,7 @@ class AppDelegate(NSObject):
             "状态：运行中\n"
             f"配置文件：{snap.get('config')}\n"
             f"配置档：{snap.get('profile')}\n"
-            f"模式：{mode_cn} | 目标窗口在前台：{yn(snap.get('target_active'))}\n"
+            f"模式：{mode_cn} | {target_line}\n"
             f"启用映射：{yn(snap.get('mapping_enabled'))} | 视角锁定：{yn(snap.get('camera_lock'))} | 背包打开：{yn(snap.get('backpack_open'))}\n"
             f"{hint}"
         )

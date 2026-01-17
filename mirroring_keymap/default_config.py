@@ -8,6 +8,7 @@ DEFAULT_CONFIG_JSON = """\
   "version": 1,
   "targetWindow": {
     "titleHint": "iPhone Mirroring",
+    "enabled": false,
     "pid": null,
     "windowId": null
   },
@@ -44,7 +45,7 @@ DEFAULT_CONFIG_JSON = """\
       },
       "fire": { "mode": "tap", "tapHoldMs": 30, "rrandPx": null },
       "scope": { "mode": "tap", "tapHoldMs": 30, "rrandPx": null },
-      "wheel": { "enabled": true, "dPx": 8, "stopMs": 120, "invert": false, "rrandPx": null },
+      "wheel": { "enabled": true, "dPx": 8, "stopMs": 120, "invert": false, "anchorPoint": [800, 400], "rrandPx": null },
       "scheduler": {
         "tickHz": 120,
         "cameraMinHz": 50,

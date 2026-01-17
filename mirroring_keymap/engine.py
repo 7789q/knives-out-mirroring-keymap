@@ -34,6 +34,7 @@ class TapRequest:
 class WheelSession:
     active: bool = False
     cursor_origin: Optional[Point] = None
+    touch_origin: Optional[Point] = None
     touch_pos: Optional[Point] = None
     last_wheel_ts: float = 0.0
     pending_steps: int = 0  # 累积滚轮步数（正负）
@@ -93,6 +94,7 @@ class Engine:
         self._camera_lock: bool = False
         self._backpack_open: bool = False
         self._target_active: bool = False
+        self._target_check_enabled: bool = bool(cfg.targetWindow.enabled)
         self._mode: Mode = Mode.PAUSED
 
         self._last_camera_ts: float = 0.0
@@ -122,6 +124,8 @@ class Engine:
 
     def start(self) -> None:
         self._log.info("Engine starting...")
+        if not self._target_check_enabled:
+            self._log.info("已关闭目标窗口检测：映射启用时将对所有前台应用生效")
         self._thread.start()
 
     def stop(self) -> None:
@@ -145,6 +149,7 @@ class Engine:
                 "mapping_enabled": self._mapping_enabled,
                 "camera_lock": self._camera_lock,
                 "backpack_open": self._backpack_open,
+                "target_check_enabled": self._target_check_enabled,
                 "target_active": self._target_active,
                 "mode": self._mode.value,
             }
@@ -397,18 +402,29 @@ class Engine:
                         swallow = True
 
         elif event_type == Quartz.kCGEventScrollWheel:
-            # 仅自由鼠标态处理滚轮映射；吞掉滚轮，避免双触发
-            if mapping_enabled and target_active and mode == Mode.FREE and self._profile.wheel.enabled:
+            # 滚轮映射：
+            # - 锁定视角（战斗模式）：使用配置的 anchorPoint 上下拖动
+            # - 解锁视角（自由鼠标）：以鼠标当前位置上下拖动（并在结束后回位）
+            # 吞掉滚轮，避免双触发
+            if mapping_enabled and target_active and self._profile.wheel.enabled and mode in (Mode.FREE, Mode.BATTLE):
                 delta = int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGScrollWheelEventDeltaAxis1))
                 if self._profile.wheel.invert:
                     delta = -delta
                 if delta != 0:
-                    loc = Quartz.CGEventGetLocation(event)
-                    pos = (float(loc.x), float(loc.y))
+                    if mode == Mode.BATTLE:
+                        anchor = self._profile.wheel.anchorPoint or self._profile.points["cameraAnchor"]
+                        touch_origin = anchor
+                        cursor_origin = None  # 战斗模式不做回位（退出战斗时会 restore_cursor）
+                    else:
+                        loc = Quartz.CGEventGetLocation(event)
+                        pos = (float(loc.x), float(loc.y))
+                        touch_origin = pos
+                        cursor_origin = pos
                     with self._lock:
                         if not self._wheel.active:
                             self._wheel.active = True
-                            self._wheel.cursor_origin = pos
+                            self._wheel.cursor_origin = cursor_origin
+                            self._wheel.touch_origin = touch_origin
                             self._wheel.touch_pos = None  # 首次 tick 决定随机落点并 down
                         self._wheel.last_wheel_ts = now
                         self._wheel.pending_steps += 1 if delta > 0 else -1
@@ -439,17 +455,21 @@ class Engine:
     def _tick(self, now: float) -> None:
         # 目标窗口检查不需要每 tick 都做
         if now - self._target_check_ts >= 0.2:
-            active = False
-            try:
-                active = is_target_frontmost(self._cfg.targetWindow)
-            except Exception as e:
-                self._log.debug("target check failed: %s", e)
+            if not self._target_check_enabled:
+                active = True
+            else:
+                active = False
+                try:
+                    active = is_target_frontmost(self._cfg.targetWindow)
+                except Exception as e:
+                    self._log.debug("target check failed: %s", e)
             with self._lock:
                 self._target_active = active
                 self._target_check_ts = now
-            if self._last_target_active_logged is None or self._last_target_active_logged != active:
-                self._last_target_active_logged = active
-                self._log.info("目标窗口在前台：%s", "是" if active else "否")
+            if self._target_check_enabled:
+                if self._last_target_active_logged is None or self._last_target_active_logged != active:
+                    self._last_target_active_logged = active
+                    self._log.info("目标窗口在前台：%s", "是" if active else "否")
 
         with self._lock:
             mapping_enabled = self._mapping_enabled
@@ -500,20 +520,25 @@ class Engine:
 
     def _tick_free(self, now: float) -> None:
         # 自由鼠标态：不做任何坐标映射，除滚轮映射外。
+        if self._service_wheel(now):
+            return
+        self._safe_release_all()
+
+    def _service_wheel(self, now: float) -> bool:
         with self._lock:
             active = self._wheel.active
             pending_steps = self._wheel.pending_steps
             last_ts = self._wheel.last_wheel_ts
             cursor_origin = self._wheel.cursor_origin
+            touch_origin = self._wheel.touch_origin
             touch_pos = self._wheel.touch_pos
 
         if not active:
-            self._safe_release_all()
-            return
+            return False
 
         # 首次 tick：确定落点并按下
         if touch_pos is None:
-            origin = cursor_origin or self._inj.get_cursor_pos()
+            origin = touch_origin or cursor_origin or self._inj.get_cursor_pos()
             r = self._profile.wheel.rrandPx
             if r is None:
                 r = self._cfg.global_.rrandDefaultPx
@@ -524,7 +549,13 @@ class Engine:
                 self._log.debug("wheel down failed: %s", e)
                 with self._lock:
                     self._wheel = WheelSession()  # reset
-                return
+                # 避免战斗态光标意外显示
+                try:
+                    if self.current_mode() == Mode.BATTLE:
+                        self._inj.hide_cursor()
+                except Exception:
+                    pass
+                return True
             with self._lock:
                 # 若期间被重置，则不强行覆盖
                 if self._wheel.active and self._wheel.touch_pos is None:
@@ -539,6 +570,7 @@ class Engine:
                 self._inj.left_up(up_pos)
             except Exception:
                 pass
+            # 自由鼠标模式：滚动结束后回位；战斗模式：不回位（退出战斗时 restore_cursor）
             if cursor_origin is not None:
                 try:
                     self._inj.warp(cursor_origin)
@@ -546,10 +578,10 @@ class Engine:
                     pass
             with self._lock:
                 self._wheel = WheelSession()
-            return
+            return True
 
         if pending_steps == 0:
-            return
+            return True
 
         # 消耗一个 step
         step = 1 if pending_steps > 0 else -1
@@ -558,7 +590,7 @@ class Engine:
 
         cur = touch_pos
         if cur is None:
-            return
+            return True
         target = (cur[0], cur[1] + step * float(self._profile.wheel.dPx))
         try:
             self._inj.drag_smooth(cur, target, max_step_px=self._profile.scheduler.maxStepPx)
@@ -566,10 +598,19 @@ class Engine:
                 if self._wheel.active:
                     self._wheel.touch_pos = target
         except Exception:
-            # 出错则重置，避免卡住
-            self._safe_release_all()
+            # 出错则重置，避免卡住；同时尽量恢复战斗态光标隐藏状态
+            try:
+                self._inj.release_all()
+            except Exception:
+                pass
+            try:
+                if self.current_mode() == Mode.BATTLE:
+                    self._inj.hide_cursor()
+            except Exception:
+                pass
             with self._lock:
                 self._wheel = WheelSession()
+        return True
 
     def _tick_battle(self, now: float) -> None:
         # 1) Tap 抢占
@@ -579,6 +620,10 @@ class Engine:
                 req = self._tap_queue.popleft()
         if req is not None:
             self._service_tap(req)
+            return
+
+        # 1.5) Wheel（滚轮映射会占用左键拖动，因此在战斗态优先独占执行）
+        if self._service_wheel(now):
             return
 
         # 2) Camera / Joystick 轮转
