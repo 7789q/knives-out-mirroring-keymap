@@ -471,25 +471,6 @@ class AppDelegate(NSObject):
         btn_backpack.setAction_("onBackpack:")
         content.addSubview_(btn_backpack)
 
-        # 目标窗口设置（避免 titleHint 不匹配导致“无反应”）
-        content.addSubview_(_label("目标窗口", 435, 505, 60))
-        self._tw_title_hint = NSTextField.alloc().initWithFrame_(NSMakeRect(495, 500, 190, 24))
-        content.addSubview_(self._tw_title_hint)
-        content.addSubview_(_label("PID", 690, 505, 28))
-        self._tw_pid = NSTextField.alloc().initWithFrame_(NSMakeRect(720, 500, 70, 24))
-        content.addSubview_(self._tw_pid)
-        self._btn_tw_detect = NSButton.alloc().initWithFrame_(NSMakeRect(800, 499, 90, 26))
-        self._btn_tw_detect.setTitle_("取前台")
-        self._btn_tw_detect.setBezelStyle_(NSBezelStyleRounded)
-        self._btn_tw_detect.setTarget_(self)
-        self._btn_tw_detect.setAction_("onDetectFrontmost:")
-        content.addSubview_(self._btn_tw_detect)
-
-        self._tw_disable = NSButton.alloc().initWithFrame_(NSMakeRect(435, 472, 300, 24))
-        self._tw_disable.setButtonType_(NSButtonTypeSwitch)
-        self._tw_disable.setTitle_("不检测目标窗口（启用映射时始终生效）")
-        content.addSubview_(self._tw_disable)
-
         # pick point
         btn_pick = NSButton.alloc().initWithFrame_(NSMakeRect(20, 435, 120, 28))
         btn_pick.setTitle_("取点（点击）")
@@ -802,10 +783,11 @@ class AppDelegate(NSObject):
 
         color_map = {
             "joystickCenter": (NSColor.systemGreenColor(), "摇杆中心"),
-            "cameraAnchor": (NSColor.systemBlueColor(), "视角锚点"),
+            # 避免与“运行时点击标记”的蓝/橙混淆
+            "cameraAnchor": (NSColor.systemTealColor(), "视角锚点"),
             "fire": (NSColor.systemRedColor(), "开火"),
             "scope": (NSColor.systemPurpleColor(), "开镜"),
-            "backpack": (NSColor.systemOrangeColor(), "背包"),
+            "backpack": (NSColor.systemYellowColor(), "背包"),
         }
 
         for k, (fx, fy) in self._point_fields.items():
@@ -817,18 +799,15 @@ class AppDelegate(NSObject):
             markers.append({"x": x, "y": y, "r": 7.0, "color": color, "label": label})
 
         # 滚轮锚点（锁定视角/战斗模式下使用）
-        p = self._profile_dict(self._selected_profile())
-        if isinstance(p, dict):
-            wheel = p.get("wheel") if isinstance(p.get("wheel"), dict) else {}
-            ap = wheel.get("anchorPoint")
-            if ap is None:
-                ap = wheel.get("anchor")
-            if isinstance(ap, (list, tuple)) and len(ap) == 2:
+        if self._wheel_anchor_x is not None and self._wheel_anchor_y is not None:
+            x_s = str(self._wheel_anchor_x.stringValue()).strip()
+            y_s = str(self._wheel_anchor_y.stringValue()).strip()
+            if x_s and y_s:
                 try:
                     markers.append(
                         {
-                            "x": float(ap[0]),
-                            "y": float(ap[1]),
+                            "x": float(x_s),
+                            "y": float(y_s),
                             "r": 7.0,
                             "color": NSColor.systemYellowColor(),
                             "label": "滚轮锚点",
@@ -957,19 +936,6 @@ class AppDelegate(NSObject):
             except Exception:
                 pass
 
-        tw = self._cfg_dict.get("targetWindow")
-        if not isinstance(tw, dict):
-            tw = {}
-        if self._tw_title_hint is not None:
-            self._tw_title_hint.setStringValue_(str(tw.get("titleHint") or "iPhone Mirroring"))
-        if self._tw_pid is not None:
-            pid = tw.get("pid")
-            self._tw_pid.setStringValue_(str(pid) if isinstance(pid, int) else "")
-        if self._tw_disable is not None:
-            enabled = tw.get("enabled")
-            enabled_b = bool(enabled) if enabled is not None else False
-            self._tw_disable.setState_(1 if not enabled_b else 0)
-
         g = self._cfg_dict.get("global")
         if not isinstance(g, dict):
             g = {}
@@ -1079,16 +1045,11 @@ class AppDelegate(NSObject):
         if not isinstance(tw, dict):
             tw = {}
             self._cfg_dict["targetWindow"] = tw
-        if self._tw_title_hint is not None:
-            tw["titleHint"] = str(self._tw_title_hint.stringValue()).strip() or "iPhone Mirroring"
-        if self._tw_pid is not None:
-            pid_s = str(self._tw_pid.stringValue()).strip()
-            try:
-                tw["pid"] = int(pid_s) if pid_s else None
-            except Exception:
-                tw["pid"] = None
-        if self._tw_disable is not None:
-            tw["enabled"] = False if bool(self._tw_disable.state()) else True
+        # 用户诉求：不需要目标窗口检测，因此固定关闭
+        tw["enabled"] = False
+        tw["pid"] = None
+        tw["windowId"] = None
+        tw["titleHint"] = str(tw.get("titleHint") or "iPhone Mirroring")
 
         g = self._cfg_dict.get("global")
         if not isinstance(g, dict):
@@ -1680,25 +1641,18 @@ class AppDelegate(NSObject):
         mode_map = {"paused": "暂停", "battle": "战斗", "free": "自由鼠标"}
         mode_cn = mode_map.get(str(snap.get("mode") or ""), str(snap.get("mode") or ""))
 
-        target_check_enabled = bool(snap.get("target_check_enabled") if snap.get("target_check_enabled") is not None else True)
-        target_line = (
-            f"目标窗口在前台：{yn(snap.get('target_active'))}" if target_check_enabled else "目标窗口检测：关闭"
-        )
-
         hint = ""
         if snap.get("accessibility_trusted") is False:
             hint = "提示：未授予“辅助功能”权限，可能无法注入点击/拖动。请到 系统设置 → 隐私与安全性 → 辅助功能 授权。"
         elif not bool(snap.get("mapping_enabled")):
             hint = "提示：映射未启用，请勾选“启用映射”或按启用热键（默认 F8）。"
-        elif target_check_enabled and not bool(snap.get("target_active")):
-            hint = "提示：目标窗口未命中/不在前台，请在上方填写正确的“目标窗口关键字”或用“取前台”填入 PID。"
         elif str(snap.get("mode")) != "battle":
             hint = "提示：当前为自由鼠标模式（不会触发开火/开镜/自定义点击），请开启“视角锁定”（默认 CapsLock）。"
 
         txt = (
             "状态：运行中\n"
             f"配置档：{snap.get('profile')}\n"
-            f"模式：{mode_cn} | {target_line}\n"
+            f"模式：{mode_cn}\n"
             f"启用映射：{yn(snap.get('mapping_enabled'))} | 视角锁定：{yn(snap.get('camera_lock'))} | 背包打开：{yn(snap.get('backpack_open'))}\n"
             f"{hint}"
         )
