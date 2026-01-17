@@ -62,11 +62,15 @@ class Engine:
         self._kc_caps = keycode_for(g.cameraLockKey)
         self._kc_backpack = keycode_for(g.backpackKey)
 
-        # WASD
-        self._kc_w = keycode_for("W")
-        self._kc_a = keycode_for("A")
-        self._kc_s = keycode_for("S")
-        self._kc_d = keycode_for("D")
+        # 移动方向键（默认 WASD，可配置）
+        self._kc_move_up = keycode_for(g.moveUpKey)
+        self._kc_move_down = keycode_for(g.moveDownKey)
+        self._kc_move_left = keycode_for(g.moveLeftKey)
+        self._kc_move_right = keycode_for(g.moveRightKey)
+
+        # 开火/开镜触发键（可配置：MouseLeft/MouseRight/任意键）
+        self._fire_trigger = self._parse_trigger(g.fireKey)
+        self._scope_trigger = self._parse_trigger(g.scopeKey)
 
         # custom tap mappings
         self._custom_by_keycode: dict[int, CustomMapping] = {}
@@ -99,6 +103,15 @@ class Engine:
 
         self._stop_evt = threading.Event()
         self._thread = threading.Thread(target=self._run_loop, name="scheduler", daemon=True)
+
+    def _parse_trigger(self, spec: str) -> tuple[str, object]:
+        s = (spec or "").strip().lower()
+        if s in ("mouseleft", "leftmouse", "mouse1", "lmb", "left"):
+            return ("mouse", "left")
+        if s in ("mouseright", "rightmouse", "mouse2", "rmb", "right"):
+            return ("mouse", "right")
+        # 默认按键名（例如 "J" / "Space" / "UpArrow"）
+        return ("key", keycode_for(spec))
 
     # -------------------------
     # Public API
@@ -160,7 +173,7 @@ class Engine:
             self._tap_queue.append(
                 TapRequest(
                     name="backpack",
-                    point=self._profile.points["I"],
+                    point=self._profile.points["backpack"],
                     hold_ms=self._profile.fire.tapHoldMs,
                     rrand_px=self._cfg.global_.rrandDefaultPx,
                 )
@@ -220,13 +233,42 @@ class Engine:
                         self._tap_queue.append(
                             TapRequest(
                                 name="backpack",
-                                point=self._profile.points["I"],
+                                point=self._profile.points["backpack"],
                                 hold_ms=self._profile.fire.tapHoldMs,
                                 rrand_px=self._cfg.global_.rrandDefaultPx,
                             )
                         )
                     self._log.info("背包 %s", "打开" if opening else "关闭")
                 else:
+                    # 内置开火/开镜：若触发键是键盘，则在此处拦截并转为 Tap
+                    if mapping_enabled and target_active and mode == Mode.BATTLE:
+                        t_type, t_val = self._fire_trigger
+                        if t_type == "key" and kc == int(t_val):
+                            with self._lock:
+                                self._tap_queue.append(
+                                    TapRequest(
+                                        name="fire",
+                                        point=self._profile.points["fire"],
+                                        hold_ms=self._profile.fire.tapHoldMs,
+                                        rrand_px=self._profile.fire.rrandPx,
+                                    )
+                                )
+                            swallow = True
+                            return True
+                        t_type, t_val = self._scope_trigger
+                        if t_type == "key" and kc == int(t_val):
+                            with self._lock:
+                                self._tap_queue.append(
+                                    TapRequest(
+                                        name="scope",
+                                        point=self._profile.points["scope"],
+                                        hold_ms=self._profile.scope.tapHoldMs,
+                                        rrand_px=self._profile.scope.rrandPx,
+                                    )
+                                )
+                            swallow = True
+                            return True
+
                     # 自定义映射：仅战斗态生效
                     if (
                         event_type == Quartz.kCGEventKeyDown
@@ -270,28 +312,56 @@ class Engine:
 
         elif event_type in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventRightMouseDown):
             if mapping_enabled and target_active and mode == Mode.BATTLE:
-                # 用 Tap 代替原生点击
-                if event_type == Quartz.kCGEventLeftMouseDown:
-                    with self._lock:
-                        self._tap_queue.append(
-                            TapRequest(
-                                name="fire",
-                                point=self._profile.points["F"],
-                                hold_ms=self._profile.fire.tapHoldMs,
-                                rrand_px=self._profile.fire.rrandPx,
+                # 用 Tap 代替原生点击（仅当触发键为鼠标时）
+                t_type, t_val = self._fire_trigger
+                if t_type == "mouse":
+                    if t_val == "left" and event_type == Quartz.kCGEventLeftMouseDown:
+                        with self._lock:
+                            self._tap_queue.append(
+                                TapRequest(
+                                    name="fire",
+                                    point=self._profile.points["fire"],
+                                    hold_ms=self._profile.fire.tapHoldMs,
+                                    rrand_px=self._profile.fire.rrandPx,
+                                )
                             )
-                        )
-                else:
-                    with self._lock:
-                        self._tap_queue.append(
-                            TapRequest(
-                                name="scope",
-                                point=self._profile.points["S"],
-                                hold_ms=self._profile.scope.tapHoldMs,
-                                rrand_px=self._profile.scope.rrandPx,
+                        swallow = True
+                    if t_val == "right" and event_type == Quartz.kCGEventRightMouseDown:
+                        with self._lock:
+                            self._tap_queue.append(
+                                TapRequest(
+                                    name="fire",
+                                    point=self._profile.points["fire"],
+                                    hold_ms=self._profile.fire.tapHoldMs,
+                                    rrand_px=self._profile.fire.rrandPx,
+                                )
                             )
-                        )
-                swallow = True
+                        swallow = True
+
+                t_type, t_val = self._scope_trigger
+                if t_type == "mouse":
+                    if t_val == "left" and event_type == Quartz.kCGEventLeftMouseDown:
+                        with self._lock:
+                            self._tap_queue.append(
+                                TapRequest(
+                                    name="scope",
+                                    point=self._profile.points["scope"],
+                                    hold_ms=self._profile.scope.tapHoldMs,
+                                    rrand_px=self._profile.scope.rrandPx,
+                                )
+                            )
+                        swallow = True
+                    if t_val == "right" and event_type == Quartz.kCGEventRightMouseDown:
+                        with self._lock:
+                            self._tap_queue.append(
+                                TapRequest(
+                                    name="scope",
+                                    point=self._profile.points["scope"],
+                                    hold_ms=self._profile.scope.tapHoldMs,
+                                    rrand_px=self._profile.scope.rrandPx,
+                                )
+                            )
+                        swallow = True
 
         elif event_type == Quartz.kCGEventScrollWheel:
             # 仅自由鼠标态处理滚轮映射；吞掉滚轮，避免双触发
@@ -483,7 +553,9 @@ class Engine:
             mouse_dy = self._mouse_dy_acc
             keys_down = set(self._keys_down)
 
-        want_move = any(k in keys_down for k in (self._kc_w, self._kc_a, self._kc_s, self._kc_d))
+        want_move = any(
+            k in keys_down for k in (self._kc_move_up, self._kc_move_down, self._kc_move_left, self._kc_move_right)
+        )
 
         camera_interval = 1.0 / max(1.0, float(self._profile.scheduler.cameraMinHz))
         joy_interval = 1.0 / max(1.0, float(self._profile.scheduler.joystickMinHz))
@@ -544,7 +616,7 @@ class Engine:
             self._mouse_dy_acc = 0.0
 
         cam = self._profile.camera
-        a = self._profile.points["A"]
+        a = self._profile.points["cameraAnchor"]
 
         sx = dx * float(cam.sensitivity)
         sy = dy * float(cam.sensitivity) * (-1.0 if cam.invertY else 1.0)
@@ -564,18 +636,18 @@ class Engine:
             self._safe_release_all()
 
     def _service_joystick(self, keys_down: set[int]) -> None:
-        c = self._profile.points["C"]
+        c = self._profile.points["joystickCenter"]
         joy = self._profile.joystick
 
         vx = 0.0
         vy = 0.0
-        if self._kc_w in keys_down:
+        if self._kc_move_up in keys_down:
             vy += 1.0
-        if self._kc_s in keys_down:
+        if self._kc_move_down in keys_down:
             vy -= 1.0
-        if self._kc_a in keys_down:
+        if self._kc_move_left in keys_down:
             vx -= 1.0
-        if self._kc_d in keys_down:
+        if self._kc_move_right in keys_down:
             vx += 1.0
         v = normalize((vx, vy))
         target = add(c, scale(v, float(joy.radiusPx)))

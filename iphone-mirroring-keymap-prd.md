@@ -500,18 +500,30 @@
     "panicHotkey": "F12",
     "cameraLockKey": "CapsLock",
     "backpackKey": "Tab",
+    "moveUpKey": "W",
+    "moveDownKey": "S",
+    "moveLeftKey": "A",
+    "moveRightKey": "D",
+    "fireKey": "MouseLeft",
+    "scopeKey": "MouseRight",
     "rrandDefaultPx": 0
   },
   "profiles": [
     {
       "name": "Default",
-      "points": { "C": [100, 200], "A": [500, 300], "F": [900, 600], "S": [980, 600], "I": [950, 80] },
+      "points": {
+        "joystickCenter": [100, 200],
+        "cameraAnchor": [500, 300],
+        "fire": [900, 600],
+        "scope": [980, 600],
+        "backpack": [950, 80]
+      },
       "joystick": { "radiusPx": 120, "tauMs": 60, "rrandPx": null },
       "camera": { "tcamPx": 3, "radiusPx": 80, "invertY": false, "sensitivity": 1.0, "rrandPx": null },
       "fire": { "mode": "tap", "tapHoldMs": 30, "rrandPx": null },
       "scope": { "mode": "tap", "tapHoldMs": 30, "rrandPx": null },
       "wheel": { "enabled": true, "dPx": 8, "stopMs": 120, "invert": false, "rrandPx": null },
-      "scheduler": { "tickHz": 120, "cameraMinHz": 50, "joystickMinHz": 20, "cameraBudgetMs": 6 }
+      "scheduler": { "tickHz": 120, "cameraMinHz": 50, "joystickMinHz": 20, "cameraBudgetMs": 6, "maxStepPx": 6 }
     }
   ],
   "customMappings": [
