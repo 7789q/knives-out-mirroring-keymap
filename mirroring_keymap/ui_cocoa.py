@@ -63,8 +63,8 @@ class _MarkerView(NSView):
             pass
 
     def isFlipped(self):  # type: ignore[override]
-        # 保持与屏幕全局坐标一致：原点左下，Y 向上
-        return False
+        # 与 Quartz 的屏幕坐标保持一致：原点左上，Y 向下
+        return True
 
     def drawRect_(self, rect) -> None:  # type: ignore[override]
         # 透明覆盖层，仅绘制点位标记
@@ -117,6 +117,8 @@ class _MarkerOverlay:
     def __init__(self) -> None:
         self._windows: list[NSWindow] = []
         self._views: list[_MarkerView] = []
+        # Quartz 坐标系下的每屏 bounds（origin=左上，Y 向下）
+        self._bounds: list[tuple[float, float, float, float]] = []
 
     def show(self) -> None:
         if self._windows:
@@ -126,6 +128,11 @@ class _MarkerOverlay:
                 except Exception:
                     pass
             return
+
+        try:
+            import Quartz
+        except Exception:
+            Quartz = None  # type: ignore[assignment]
 
         for screen in NSScreen.screens() or []:
             frame = screen.frame()
@@ -149,6 +156,21 @@ class _MarkerOverlay:
             w.orderFront_(None)
             self._windows.append(w)
             self._views.append(v)
+            # 记录该屏在 Quartz 下的 bounds，用于把“取点/注入”的坐标正确映射到覆盖层
+            bx, by, bw, bh = 0.0, 0.0, float(frame.size.width), float(frame.size.height)
+            try:
+                if Quartz is not None:
+                    dd = screen.deviceDescription()
+                    did = dd.get("NSScreenNumber") if hasattr(dd, "get") else None
+                    if did is not None:
+                        b = Quartz.CGDisplayBounds(int(did))
+                        bx = float(b.origin.x)
+                        by = float(b.origin.y)
+                        bw = float(b.size.width)
+                        bh = float(b.size.height)
+            except Exception:
+                pass
+            self._bounds.append((bx, by, bw, bh))
 
     def hide(self) -> None:
         for w in self._windows:
@@ -158,12 +180,13 @@ class _MarkerOverlay:
                 pass
         self._windows = []
         self._views = []
+        self._bounds = []
 
     def update(self, markers_global: list[dict]) -> None:
         if not self._windows:
             return
 
-        # 按屏幕分发坐标（全局 -> 每屏局部）
+        # 按屏幕分发坐标（Quartz 全局 -> 每屏局部）
         per_view: list[list[dict]] = [[] for _ in self._views]
         for m in markers_global:
             try:
@@ -171,14 +194,12 @@ class _MarkerOverlay:
                 gy = float(m.get("y", 0.0))
             except Exception:
                 continue
-            for idx, w in enumerate(self._windows):
-                frame = w.frame()
-                fx = frame.origin.x
-                fy = frame.origin.y
-                if gx >= fx and gx <= fx + frame.size.width and gy >= fy and gy <= fy + frame.size.height:
+            for idx, (bx, by, bw, bh) in enumerate(self._bounds):
+                # Quartz 坐标：origin=左上，Y 向下
+                if gx >= bx and gx <= bx + bw and gy >= by and gy <= by + bh:
                     mm = dict(m)
-                    mm["x"] = gx - fx
-                    mm["y"] = gy - fy
+                    mm["x"] = gx - bx
+                    mm["y"] = gy - by
                     per_view[idx].append(mm)
                     break
 
@@ -365,41 +386,24 @@ class AppDelegate(NSObject):
             lbl.setStringValue_(text)
             return lbl
 
-        # 顶部：配置路径
-        self._cfg_path_field = NSTextField.alloc().initWithFrame_(NSMakeRect(20, 610, 650, 24))
-        self._cfg_path_field.setStringValue_(self._app.default_config_path())
-        content.addSubview_(self._cfg_path_field)
-
-        btn_choose = NSButton.alloc().initWithFrame_(NSMakeRect(680, 608, 100, 28))
-        btn_choose.setTitle_("选择…")
-        btn_choose.setBezelStyle_(NSBezelStyleRounded)
-        btn_choose.setTarget_(self)
-        btn_choose.setAction_("onChooseConfig:")
-        content.addSubview_(btn_choose)
-
-        self._btn_open_cfg = NSButton.alloc().initWithFrame_(NSMakeRect(790, 608, 100, 28))
-        self._btn_open_cfg.setTitle_("打开")
-        self._btn_open_cfg.setBezelStyle_(NSBezelStyleRounded)
-        self._btn_open_cfg.setTarget_(self)
-        self._btn_open_cfg.setAction_("onOpenConfig:")
-        content.addSubview_(self._btn_open_cfg)
-
+        # 顶部：不暴露/不选择配置文件（设置以 UI 为准，自动持久化到用户目录）
+        content.addSubview_(_label("设置会自动保存（无需选择配置文件）", 20, 620, 420))
         # Profile + 保存/重载
-        self._profile_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(20, 575, 220, 26), False)
+        self._profile_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(20, 590, 220, 26), False)
         self._profile_popup.setTarget_(self)
         self._profile_popup.setAction_("onProfileChanged:")
         content.addSubview_(self._profile_popup)
-        content.addSubview_(_label("配置档", 250, 575, 80))
+        content.addSubview_(_label("配置档", 250, 590, 80))
 
-        btn_save = NSButton.alloc().initWithFrame_(NSMakeRect(680, 570, 100, 28))
-        btn_save.setTitle_("保存配置")
+        btn_save = NSButton.alloc().initWithFrame_(NSMakeRect(680, 588, 100, 28))
+        btn_save.setTitle_("保存设置")
         btn_save.setBezelStyle_(NSBezelStyleRounded)
         btn_save.setTarget_(self)
         btn_save.setAction_("onSaveConfig:")
         content.addSubview_(btn_save)
 
-        btn_reload = NSButton.alloc().initWithFrame_(NSMakeRect(790, 570, 100, 28))
-        btn_reload.setTitle_("重载配置")
+        btn_reload = NSButton.alloc().initWithFrame_(NSMakeRect(790, 588, 100, 28))
+        btn_reload.setTitle_("重新加载")
         btn_reload.setBezelStyle_(NSBezelStyleRounded)
         btn_reload.setTarget_(self)
         btn_reload.setAction_("onReloadConfig:")
@@ -707,22 +711,8 @@ class AppDelegate(NSObject):
 
     @objc.python_method
     def _cfg_path(self) -> str:
-        s = str(self._cfg_path_field.stringValue()).strip() if self._cfg_path_field is not None else ""
-        if not s:
-            s = self._app.default_config_path()
-            if self._cfg_path_field is not None:
-                self._cfg_path_field.setStringValue_(s)
-            return s
-
-        # Finder 双击启动 .app 时，cwd 通常会落在 Contents/Resources。
-        # 为避免用户输入相对路径导致误读/误写到 .app 内，这里将相对路径统一解析到用户配置目录。
-        p = Path(s).expanduser()
-        if not p.is_absolute():
-            base = Path(self._app.default_config_path()).expanduser().parent
-            s = str((base / p).resolve())
-            if self._cfg_path_field is not None:
-                self._cfg_path_field.setStringValue_(s)
-        return s
+        # 固定使用默认路径：设置以 UI 为准并自动保存；不提供“选择配置文件”的入口，避免误操作。
+        return self._app.default_config_path()
 
     @objc.python_method
     def _selected_profile(self) -> Optional[str]:
@@ -1707,7 +1697,6 @@ class AppDelegate(NSObject):
 
         txt = (
             "状态：运行中\n"
-            f"配置文件：{snap.get('config')}\n"
             f"配置档：{snap.get('profile')}\n"
             f"模式：{mode_cn} | {target_line}\n"
             f"启用映射：{yn(snap.get('mapping_enabled'))} | 视角锁定：{yn(snap.get('camera_lock'))} | 背包打开：{yn(snap.get('backpack_open'))}\n"
