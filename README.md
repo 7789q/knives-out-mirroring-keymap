@@ -24,16 +24,17 @@ pip install -e .
 
 ## 快速开始
 
-1) 复制并编辑示例配置：
+1) 复制并编辑示例配置（推荐放到默认路径，避免相对路径在 `.app` 下落到 Resources）：
 
 ```bash
-cp config.example.json config.json
+mkdir -p ~/Library/Application\ Support/MirroringKeymap
+cp config.example.json ~/Library/Application\ Support/MirroringKeymap/config.json
 ```
 
 2) 干跑（只解析配置，不做任何捕获/注入）：
 
 ```bash
-mirroring-keymap --config config.json --dry-run
+mirroring-keymap --dry-run
 ```
 
 3) 取点（点击一次屏幕，打印坐标；用于填配置里的摇杆中心/视角锚点/开火/开镜/背包按钮等点位）：
@@ -45,7 +46,7 @@ mirroring-keymap pick
 4) 正式运行：
 
 ```bash
-mirroring-keymap --config config.json --run
+mirroring-keymap --run
 ```
 
 ## UI（macOS）
@@ -67,6 +68,15 @@ open dist/MirroringKeymap.app
 首次启动 UI 时，会在 `~/Library/Application Support/MirroringKeymap/config.json` 自动生成一份默认配置（点位为占位值），你可以在 UI 里点“打开”直接编辑。
 
 UI 支持直接修改常用参数并保存（配置档点位/部分手感参数/全局热键），也支持在“自定义点击”里新增多条 `按键 -> 点击坐标` 映射。
+
+运行日志默认写入：
+
+- `~/Library/Logs/MirroringKeymap/mirroring_keymap.log`
+
+当勾选“显示点位标记（调试）”时：
+
+- 会显示关键点位/自定义点击点位
+- 当触发点击（开火/开镜/背包/自定义）时，会额外显示“实际点击点位”：蓝色表示最近一次点位，橙色表示按下状态
 
 ## 坐标说明
 

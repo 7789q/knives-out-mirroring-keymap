@@ -25,9 +25,18 @@ class Mode(str, Enum):
 @dataclass(frozen=True)
 class TapRequest:
     name: str
+    key_label: str
     point: Point
     hold_ms: int
     rrand_px: Optional[float]
+
+
+@dataclass
+class ClickMarker:
+    x: float
+    y: float
+    label: str
+    pressed_until_ts: float
 
 
 @dataclass
@@ -103,8 +112,15 @@ class Engine:
 
         self._battle_cursor_snap: Optional[CursorSnapshot] = None
 
+        # 供 UI 覆盖层显示“按键点击点位”（蓝/橙）
+        self._click_markers: dict[str, ClickMarker] = {}
+
+        # 权限检测（辅助功能/注入）
+        self._accessibility_trusted: Optional[bool] = None
+
         # 日志：避免在 tick 循环里刷屏，仅在变化时输出
         self._last_target_active_logged: Optional[bool] = None
+        self._ignore_log_last: dict[str, float] = {}
 
         self._stop_evt = threading.Event()
         self._thread = threading.Thread(target=self._run_loop, name="scheduler", daemon=True)
@@ -124,6 +140,7 @@ class Engine:
 
     def start(self) -> None:
         self._log.info("Engine starting...")
+        self._check_permissions()
         if not self._target_check_enabled:
             self._log.info("已关闭目标窗口检测：映射启用时将对所有前台应用生效")
         self._thread.start()
@@ -152,7 +169,33 @@ class Engine:
                 "target_check_enabled": self._target_check_enabled,
                 "target_active": self._target_active,
                 "mode": self._mode.value,
+                "accessibility_trusted": self._accessibility_trusted,
             }
+
+    def click_markers(self) -> list[dict[str, object]]:
+        now = time.monotonic()
+        with self._lock:
+            return [
+                {
+                    "x": m.x,
+                    "y": m.y,
+                    "label": m.label,
+                    "pressed": now < float(m.pressed_until_ts),
+                }
+                for m in self._click_markers.values()
+            ]
+
+    def _check_permissions(self) -> None:
+        # 仅用于日志/提示，不尝试触发系统弹窗，避免影响体验。
+        try:
+            import Quartz
+
+            self._accessibility_trusted = bool(Quartz.AXIsProcessTrusted())
+        except Exception:
+            self._accessibility_trusted = None
+
+        if self._accessibility_trusted is False:
+            self._log.warning("未授予“辅助功能”权限：可能无法注入点击/拖动。请到 系统设置 → 隐私与安全性 → 辅助功能 授权。")
 
     def set_mapping_enabled(self, enabled: bool) -> None:
         with self._lock:
@@ -187,6 +230,7 @@ class Engine:
             self._tap_queue.append(
                 TapRequest(
                     name="backpack",
+                    key_label=self._cfg.global_.backpackKey,
                     point=self._profile.points["backpack"],
                     hold_ms=self._profile.fire.tapHoldMs,
                     rrand_px=self._cfg.global_.rrandDefaultPx,
@@ -248,6 +292,7 @@ class Engine:
                         self._tap_queue.append(
                             TapRequest(
                                 name="backpack",
+                                key_label=self._cfg.global_.backpackKey,
                                 point=self._profile.points["backpack"],
                                 hold_ms=self._profile.fire.tapHoldMs,
                                 rrand_px=self._cfg.global_.rrandDefaultPx,
@@ -269,6 +314,7 @@ class Engine:
                                 self._tap_queue.append(
                                     TapRequest(
                                         name="fire",
+                                        key_label=self._cfg.global_.fireKey,
                                         point=self._profile.points["fire"],
                                         hold_ms=self._profile.fire.tapHoldMs,
                                         rrand_px=self._profile.fire.rrandPx,
@@ -291,6 +337,7 @@ class Engine:
                                 self._tap_queue.append(
                                     TapRequest(
                                         name="scope",
+                                        key_label=self._cfg.global_.scopeKey,
                                         point=self._profile.points["scope"],
                                         hold_ms=self._profile.scope.tapHoldMs,
                                         rrand_px=self._profile.scope.rrandPx,
@@ -313,13 +360,14 @@ class Engine:
                             with self._lock:
                                 self._tap_queue.append(
                                     TapRequest(
-                                        name=f"custom:{m.name}",
+                                        name=f"custom:{m.key}",
+                                        key_label=f"{m.key}:{m.name}" if m.name else m.key,
                                         point=m.point,
                                         hold_ms=m.tapHoldMs,
                                         rrand_px=m.rrandPx,
                                     )
                                 )
-                            self._log.debug("enqueue tap: custom:%s", m.name)
+                            self._log.debug("enqueue tap: custom:%s", m.key)
 
             # CapsLock 使用 flagsChanged 更可靠
             if event_type == Quartz.kCGEventFlagsChanged and kc == self._kc_caps and mapping_enabled and target_active:
@@ -345,6 +393,20 @@ class Engine:
                 swallow = True
 
         elif event_type in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventRightMouseDown):
+            def _throttle(key: str, interval_s: float = 0.8) -> bool:
+                last = self._ignore_log_last.get(key, 0.0)
+                if now - last < interval_s:
+                    return False
+                self._ignore_log_last[key] = now
+                return True
+
+            # 鼠标触发下：当用户已启用映射但条件不满足时，给出更明确的日志（避免“按了没反应”）
+            if (self._fire_trigger[0] == "mouse" or self._scope_trigger[0] == "mouse") and mapping_enabled:
+                if not target_active and _throttle("mouse_click_ignored_target"):
+                    self._log.warning("鼠标点击映射被忽略：目标窗口未在前台/未命中（可在配置中关闭目标检测）")
+                elif mode != Mode.BATTLE and _throttle("mouse_click_ignored_mode"):
+                    self._log.warning("鼠标点击映射被忽略：当前模式=%s（需要视角锁定/战斗模式）", mode.value)
+
             if mapping_enabled and target_active and mode == Mode.BATTLE:
                 # 用 Tap 代替原生点击（仅当触发键为鼠标时）
                 t_type, t_val = self._fire_trigger
@@ -354,6 +416,7 @@ class Engine:
                             self._tap_queue.append(
                                 TapRequest(
                                     name="fire",
+                                    key_label=self._cfg.global_.fireKey,
                                     point=self._profile.points["fire"],
                                     hold_ms=self._profile.fire.tapHoldMs,
                                     rrand_px=self._profile.fire.rrandPx,
@@ -366,6 +429,7 @@ class Engine:
                             self._tap_queue.append(
                                 TapRequest(
                                     name="fire",
+                                    key_label=self._cfg.global_.fireKey,
                                     point=self._profile.points["fire"],
                                     hold_ms=self._profile.fire.tapHoldMs,
                                     rrand_px=self._profile.fire.rrandPx,
@@ -381,6 +445,7 @@ class Engine:
                             self._tap_queue.append(
                                 TapRequest(
                                     name="scope",
+                                    key_label=self._cfg.global_.scopeKey,
                                     point=self._profile.points["scope"],
                                     hold_ms=self._profile.scope.tapHoldMs,
                                     rrand_px=self._profile.scope.rrandPx,
@@ -393,6 +458,7 @@ class Engine:
                             self._tap_queue.append(
                                 TapRequest(
                                     name="scope",
+                                    key_label=self._cfg.global_.scopeKey,
                                     point=self._profile.points["scope"],
                                     hold_ms=self._profile.scope.tapHoldMs,
                                     rrand_px=self._profile.scope.rrandPx,
@@ -680,10 +746,17 @@ class Engine:
         if r is None:
             r = self._cfg.global_.rrandDefaultPx
         p2 = random_point(p, float(r or 0.0), rng=self._rng)
-        if req.name == "backpack" or req.name.startswith("custom:"):
-            self._log.info("点击: %s @ (%.1f, %.1f)", req.name, p2[0], p2[1])
-        else:
-            self._log.debug("tap: %s @ (%.1f, %.1f)", req.name, p2[0], p2[1])
+        label = (req.key_label or req.name).strip()
+
+        # 记录本次“实际点击点位”，供 UI 覆盖层显示：默认蓝色，按下时橙色。
+        with self._lock:
+            # Tap 按压一般很短（默认 30ms），UI 刷新频率较低时会看不到“橙色按下态”。
+            # 因此这里强制至少保留一小段“按下”窗口，便于用户观察与排查。
+            hold_s = max(0.0, float(req.hold_ms) / 1000.0)
+            pressed_until = time.monotonic() + max(0.25, hold_s)
+            self._click_markers[req.name] = ClickMarker(x=p2[0], y=p2[1], label=label, pressed_until_ts=pressed_until)
+
+        self._log.info("点击: %s (键=%s) @ (%.1f, %.1f)", req.name, label, p2[0], p2[1])
         try:
             self._inj.tap(p2, hold_ms=req.hold_ms)
         finally:
