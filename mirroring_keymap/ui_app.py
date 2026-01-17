@@ -215,6 +215,15 @@ class UIApp:
         )
         return snap
 
+    def click_markers(self) -> list[dict[str, object]]:
+        rt = self._runtime
+        if rt is None:
+            return []
+        try:
+            return rt.engine.click_markers()
+        except Exception:
+            return []
+
     def set_mapping_enabled(self, enabled: bool) -> None:
         rt = self._runtime
         if rt is None:

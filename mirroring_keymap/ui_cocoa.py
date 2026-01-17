@@ -270,6 +270,9 @@ class AppDelegate(NSObject):
 
         # 点位标记覆盖层
         self._overlay = None
+
+        # 记录配置文件 mtime，用于提示“外部修改未生效/需要重载”
+        self._cfg_mtime = None
         return self
 
     # --------------------
@@ -843,6 +846,28 @@ class AppDelegate(NSObject):
                     label = f"{key}:{name}" if key or name else "自定义"
                     markers.append({"x": x, "y": y, "r": 6.0, "color": NSColor.systemTealColor(), "label": label})
 
+        # 运行时：最近一次“实际点击点位”（默认蓝色，按下时橙色）
+        try:
+            for m in self._app.click_markers():
+                try:
+                    x = float(m.get("x", 0.0))
+                    y = float(m.get("y", 0.0))
+                except Exception:
+                    continue
+                pressed = bool(m.get("pressed"))
+                label = str(m.get("label") or "")
+                markers.append(
+                    {
+                        "x": x,
+                        "y": y,
+                        "r": 6.5,
+                        "color": NSColor.systemOrangeColor() if pressed else NSColor.systemBlueColor(),
+                        "label": label,
+                    }
+                )
+        except Exception:
+            pass
+
         return markers
 
     @objc.python_method
@@ -918,7 +943,7 @@ class AppDelegate(NSObject):
             self._tw_pid.setStringValue_(str(pid) if isinstance(pid, int) else "")
         if self._tw_disable is not None:
             enabled = tw.get("enabled")
-            enabled_b = bool(enabled) if enabled is not None else True
+            enabled_b = bool(enabled) if enabled is not None else False
             self._tw_disable.setState_(1 if not enabled_b else 0)
 
         g = self._cfg_dict.get("global")
@@ -1248,6 +1273,9 @@ class AppDelegate(NSObject):
             self._alert("检测失败", str(e))
 
     def onStart_(self, _sender) -> None:
+        # 启动前自动保存一次，确保“直接点开始”也能使用当前表单值
+        if not self._save_current_config():
+            return
         try:
             self._app.start(self._cfg_path(), self._selected_profile())
         except Exception as e:
@@ -1368,6 +1396,11 @@ class AppDelegate(NSObject):
             self._alert("加载配置失败", str(e))
             return
 
+        try:
+            self._cfg_mtime = Path(path).expanduser().stat().st_mtime
+        except Exception:
+            self._cfg_mtime = None
+
         # 刷新 profile 列表
         profiles = self._profiles_list()
         names: list[str] = []
@@ -1401,25 +1434,64 @@ class AppDelegate(NSObject):
         except Exception as e:
             self._log.debug("config validate failed: %s", e)
 
-    def onSaveConfig_(self, _sender) -> None:
+    @objc.python_method
+    def _save_current_config(self) -> bool:
+        """
+        将 UI 表单写入配置文件并做严格校验。
+        返回 True 表示保存成功且配置可被引擎加载。
+        """
         if not isinstance(self._cfg_dict, dict):
             self.onReloadConfig_(None)
         if not isinstance(self._cfg_dict, dict):
-            return
+            return False
 
+        path = self._cfg_path()
+        # 若配置文件被外部编辑过但 UI 还没重载，直接保存会把外部修改覆盖掉。
+        try:
+            cur_mtime = Path(path).expanduser().stat().st_mtime
+            if self._cfg_mtime is not None and cur_mtime != self._cfg_mtime:
+                self._alert("需要重载配置", "检测到配置文件已在外部修改。请先点击“重载配置”，确认内容后再保存/启动。")
+                return False
+        except Exception:
+            pass
         try:
             self._apply_ui_to_cfg()
-            self._app.save_config_dict(self._cfg_path(), self._cfg_dict)
+            self._app.save_config_dict(path, self._cfg_dict)
         except Exception as e:
             self._alert("保存失败", str(e))
-            return
+            return False
 
         # 保存后做一次严格校验，提示更明确
         try:
-            self._app.load_config(self._cfg_path())
+            self._app.load_config(path)
         except Exception as e:
             self._alert("保存成功但配置无效", str(e))
+            return False
+
+        try:
+            self._cfg_mtime = Path(path).expanduser().stat().st_mtime
+        except Exception:
+            self._cfg_mtime = None
+
+        return True
+
+    def onSaveConfig_(self, _sender) -> None:
+        snap = self._app.snapshot()
+        was_running = bool(snap.get("running"))
+        prev_mapping = bool(snap.get("mapping_enabled"))
+        prev_camera = bool(snap.get("camera_lock"))
+
+        if not self._save_current_config():
             return
+
+        # 运行中保存：自动重启引擎使配置立即生效（解决“改了坐标但没变化”）
+        if was_running:
+            try:
+                self._app.start(self._cfg_path(), self._selected_profile())
+                self._app.set_mapping_enabled(prev_mapping)
+                self._app.set_camera_lock(prev_camera)
+            except Exception as e:
+                self._alert("应用配置失败", str(e))
 
         self.onReloadConfig_(None)
 
@@ -1568,7 +1640,9 @@ class AppDelegate(NSObject):
         )
 
         hint = ""
-        if not bool(snap.get("mapping_enabled")):
+        if snap.get("accessibility_trusted") is False:
+            hint = "提示：未授予“辅助功能”权限，可能无法注入点击/拖动。请到 系统设置 → 隐私与安全性 → 辅助功能 授权。"
+        elif not bool(snap.get("mapping_enabled")):
             hint = "提示：映射未启用，请勾选“启用映射”或按启用热键（默认 F8）。"
         elif target_check_enabled and not bool(snap.get("target_active")):
             hint = "提示：目标窗口未命中/不在前台，请在上方填写正确的“目标窗口关键字”或用“取前台”填入 PID。"

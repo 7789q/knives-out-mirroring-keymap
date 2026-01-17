@@ -23,7 +23,9 @@ def _as_point(v: Any, *, field: str) -> Point:
 class TargetWindowConfig:
     titleHint: str
     # 关闭后将跳过目标窗口检测（映射启用时对所有前台应用生效）
-    enabled: bool = True
+    # 默认关闭：iPhone Mirroring 的窗口识别在不同系统/语言环境下容易不稳定，
+    # 且会导致“目标窗口未命中 → 映射无反应”的误判。
+    enabled: bool = False
     pid: Optional[int] = None
     windowId: Optional[int] = None
 
@@ -137,7 +139,7 @@ def load_config(path: str | Path) -> AppConfig:
     if not isinstance(tw, dict):
         raise ValueError("targetWindow 必须是对象")
     title_hint = str(tw.get("titleHint") or "iPhone Mirroring")
-    enabled = bool(tw.get("enabled") if tw.get("enabled") is not None else True)
+    enabled = bool(tw.get("enabled") if tw.get("enabled") is not None else False)
     pid = tw.get("pid", None)
     pid_i = int(pid) if isinstance(pid, int) else None
     wid = tw.get("windowId", None)

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from .config import load_config, select_profile
+from .default_config import DEFAULT_CONFIG_JSON
 
 
 def _setup_logging(level: str) -> None:
@@ -18,7 +19,20 @@ def _setup_logging(level: str) -> None:
     )
 
 
+def _default_config_path() -> str:
+    # 与 UI 保持一致：避免 Finder 启动 .app / cwd 位于 Resources 时去读写 .app 内的相对路径。
+    return str(Path.home() / "Library" / "Application Support" / "MirroringKeymap" / "config.json")
+
+
+def _ensure_default_config_exists(path: str) -> None:
+    p = Path(path).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if not p.exists():
+        p.write_text(DEFAULT_CONFIG_JSON, encoding="utf-8")
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
+    _ensure_default_config_exists(args.config)
     cfg = load_config(args.config)
     profile = select_profile(cfg, args.profile)
 
@@ -143,7 +157,7 @@ def _cmd_pick(_args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="mirroring-keymap")
     p.add_argument("--log-level", default="INFO", help="日志等级（DEBUG/INFO/WARN/ERROR）")
-    p.add_argument("--config", default="config.json", help="配置文件路径（JSON）")
+    p.add_argument("--config", default=_default_config_path(), help="配置文件路径（JSON）")
     p.add_argument("--profile", default=None, help="使用的配置档名称（默认第一个）")
     p.add_argument("--run", action="store_true", help="启用捕获/注入（危险：会吞输入）")
     p.add_argument("--dry-run", action="store_true", help="只解析配置并打印，不做捕获/注入")
