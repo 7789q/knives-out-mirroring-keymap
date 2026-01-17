@@ -69,6 +69,12 @@ class AppDelegate(NSObject):
         self._global_panic_hotkey = None
         self._global_camera_lock_key = None
         self._global_backpack_key = None
+        self._global_move_up_key = None
+        self._global_move_down_key = None
+        self._global_move_left_key = None
+        self._global_move_right_key = None
+        self._global_fire_key = None
+        self._global_scope_key = None
         self._global_rrand_default = None
 
         self._point_fields = {}  # {"C": (xField, yField), ...}
@@ -136,7 +142,7 @@ class AppDelegate(NSObject):
         main_menu.addItem_(app_menu_item)
 
         app_menu = NSMenu.alloc().init()
-        quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Quit", "terminate:", "q")
+        quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("退出", "terminate:", "q")
         app_menu.addItem_(quit_item)
         app_menu_item.setSubmenu_(app_menu)
 
@@ -152,7 +158,7 @@ class AppDelegate(NSObject):
         self._window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, 920, 650), style, 2, False
         )
-        self._window.setTitle_("Mirroring Keymap (MVP)")
+        self._window.setTitle_("荒野行动按键映射（MVP）")
         self._window.center()
 
         content = self._window.contentView()
@@ -189,7 +195,7 @@ class AppDelegate(NSObject):
         self._profile_popup.setTarget_(self)
         self._profile_popup.setAction_("onProfileChanged:")
         content.addSubview_(self._profile_popup)
-        content.addSubview_(_label("Profile", 250, 575, 80))
+        content.addSubview_(_label("配置档", 250, 575, 80))
 
         btn_save = NSButton.alloc().initWithFrame_(NSMakeRect(680, 570, 100, 28))
         btn_save.setTitle_("保存配置")
@@ -269,22 +275,28 @@ class AppDelegate(NSObject):
         # 左侧：点位 + 参数（选中 profile）
         # --------------------
         xL = 20
-        xR = 470
+        xR = 435
 
-        content.addSubview_(_label("点位（屏幕坐标）", xL, 390, 200))
-        content.addSubview_(_label("X", xL + 30, 370, 100))
-        content.addSubview_(_label("Y", xL + 140, 370, 100))
+        content.addSubview_(_label("关键点位（屏幕坐标）", xL, 390, 200))
+        content.addSubview_(_label("X", xL + 90, 370, 100))
+        content.addSubview_(_label("Y", xL + 200, 370, 100))
 
         self._point_fields = {}
-        point_keys = ["C", "A", "F", "S", "I"]
-        for idx, key in enumerate(point_keys):
+        point_defs = [
+            ("joystickCenter", "摇杆中心"),
+            ("cameraAnchor", "视角锚点"),
+            ("fire", "开火点击"),
+            ("scope", "开镜点击"),
+            ("backpack", "背包按钮"),
+        ]
+        for idx, (key, label) in enumerate(point_defs):
             y = 330 - idx * 30
-            content.addSubview_(_label(key, xL, y + 2, 20))
-            fx = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 30, y, 100, 24))
-            fy = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 140, y, 100, 24))
+            content.addSubview_(_label(label, xL, y + 2, 80))
+            fx = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 90, y, 100, 24))
+            fy = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 200, y, 100, 24))
             content.addSubview_(fx)
             content.addSubview_(fy)
-            btn_fill = NSButton.alloc().initWithFrame_(NSMakeRect(xL + 250, y - 1, 80, 26))
+            btn_fill = NSButton.alloc().initWithFrame_(NSMakeRect(xL + 310, y - 1, 80, 26))
             btn_fill.setTitle_("填入取点")
             btn_fill.setBezelStyle_(NSBezelStyleRounded)
             btn_fill.setTag_(idx)
@@ -293,7 +305,7 @@ class AppDelegate(NSObject):
             content.addSubview_(btn_fill)
             self._point_fields[key] = (fx, fy)
 
-        content.addSubview_(_label("参数（当前 Profile）", xL, 190, 200))
+        content.addSubview_(_label("手感参数（当前配置档）", xL, 190, 200))
 
         content.addSubview_(_label("摇杆半径", xL, 155, 80))
         self._joy_radius = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 80, 150, 80, 24))
@@ -322,48 +334,70 @@ class AppDelegate(NSObject):
         content.addSubview_(_label("D", xL + 120, 95, 20))
         self._wheel_d = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 140, 90, 60, 24))
         content.addSubview_(self._wheel_d)
-        content.addSubview_(_label("Stop(ms)", xL + 210, 95, 60))
+        content.addSubview_(_label("停止(ms)", xL + 210, 95, 60))
         self._wheel_stop = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 270, 90, 70, 24))
         content.addSubview_(self._wheel_stop)
 
-        content.addSubview_(_label("tick", xL, 65, 35))
-        self._sched_tick = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 35, 60, 45, 24))
+        content.addSubview_(_label("调度Hz", xL, 65, 45))
+        self._sched_tick = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 45, 60, 45, 24))
         content.addSubview_(self._sched_tick)
-        content.addSubview_(_label("camMin", xL + 90, 65, 55))
+        content.addSubview_(_label("视角Hz", xL + 100, 65, 50))
         self._sched_cam_min = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 145, 60, 45, 24))
         content.addSubview_(self._sched_cam_min)
-        content.addSubview_(_label("joyMin", xL + 200, 65, 55))
-        self._sched_joy_min = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 255, 60, 45, 24))
+        content.addSubview_(_label("摇杆Hz", xL + 200, 65, 50))
+        self._sched_joy_min = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 245, 60, 45, 24))
         content.addSubview_(self._sched_joy_min)
-        content.addSubview_(_label("step", xL + 310, 65, 55))
-        self._sched_max_step = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 365, 60, 45, 24))
+        content.addSubview_(_label("步长px", xL + 300, 65, 50))
+        self._sched_max_step = NSTextField.alloc().initWithFrame_(NSMakeRect(xL + 350, 60, 45, 24))
         content.addSubview_(self._sched_max_step)
 
         # --------------------
         # 右侧：全局设置 + 自定义点击
         # --------------------
-        content.addSubview_(_label("全局设置", xR, 390, 200))
+        content.addSubview_(_label("按键设置（全局）", xR, 390, 200))
 
-        content.addSubview_(_label("启用热键", xR, 355, 70))
-        self._global_enable_hotkey = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 70, 350, 80, 24))
+        # 第一行：启用/紧急/开火/开镜
+        content.addSubview_(_label("启用热键", xR, 355, 60))
+        self._global_enable_hotkey = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 60, 350, 50, 24))
         content.addSubview_(self._global_enable_hotkey)
-        content.addSubview_(_label("紧急热键", xR + 160, 355, 70))
-        self._global_panic_hotkey = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 230, 350, 80, 24))
+        content.addSubview_(_label("紧急热键", xR + 120, 355, 60))
+        self._global_panic_hotkey = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 180, 350, 50, 24))
         content.addSubview_(self._global_panic_hotkey)
+        content.addSubview_(_label("开火键", xR + 240, 355, 45))
+        self._global_fire_key = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 285, 350, 70, 24))
+        content.addSubview_(self._global_fire_key)
+        content.addSubview_(_label("开镜键", xR + 360, 355, 45))
+        self._global_scope_key = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 405, 350, 70, 24))
+        content.addSubview_(self._global_scope_key)
 
-        content.addSubview_(_label("视角键", xR, 325, 50))
-        self._global_camera_lock_key = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 50, 320, 100, 24))
+        # 第二行：视角/背包/移动
+        content.addSubview_(_label("视角键", xR, 325, 45))
+        self._global_camera_lock_key = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 45, 320, 70, 24))
         content.addSubview_(self._global_camera_lock_key)
-        content.addSubview_(_label("背包键", xR + 160, 325, 50))
-        self._global_backpack_key = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 210, 320, 100, 24))
+        content.addSubview_(_label("背包键", xR + 120, 325, 45))
+        self._global_backpack_key = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 165, 320, 70, 24))
         content.addSubview_(self._global_backpack_key)
+        content.addSubview_(_label("移动", xR + 240, 325, 30))
+        content.addSubview_(_label("上", xR + 270, 325, 15))
+        self._global_move_up_key = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 285, 320, 35, 24))
+        content.addSubview_(self._global_move_up_key)
+        content.addSubview_(_label("下", xR + 325, 325, 15))
+        self._global_move_down_key = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 340, 320, 35, 24))
+        content.addSubview_(self._global_move_down_key)
+        content.addSubview_(_label("左", xR + 380, 325, 15))
+        self._global_move_left_key = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 395, 320, 35, 24))
+        content.addSubview_(self._global_move_left_key)
+        content.addSubview_(_label("右", xR + 435, 325, 15))
+        self._global_move_right_key = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 450, 320, 35, 24))
+        content.addSubview_(self._global_move_right_key)
 
-        content.addSubview_(_label("RrandDefault", xR, 295, 90))
-        self._global_rrand_default = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 90, 290, 60, 24))
+        # 第三行：随机半径默认值
+        content.addSubview_(_label("随机半径(px)", xR, 295, 80))
+        self._global_rrand_default = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 80, 290, 60, 24))
         content.addSubview_(self._global_rrand_default)
 
         # 自定义点击
-        content.addSubview_(_label("自定义点击（键→Tap）", xR, 260, 200))
+        content.addSubview_(_label("自定义点击（按键→点击）", xR, 260, 200))
 
         content.addSubview_(_label("名称", xR, 235, 40))
         self._custom_name = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 40, 230, 160, 24))
@@ -378,10 +412,10 @@ class AppDelegate(NSObject):
         content.addSubview_(_label("Y", xR + 90, 205, 15))
         self._custom_y = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 105, 200, 70, 24))
         content.addSubview_(self._custom_y)
-        content.addSubview_(_label("hold(ms)", xR + 180, 205, 55))
+        content.addSubview_(_label("按压(ms)", xR + 180, 205, 55))
         self._custom_hold = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 235, 200, 55, 24))
         content.addSubview_(self._custom_hold)
-        content.addSubview_(_label("rrand", xR + 295, 205, 40))
+        content.addSubview_(_label("随机(px)", xR + 295, 205, 50))
         self._custom_rrand = NSTextField.alloc().initWithFrame_(NSMakeRect(xR + 335, 200, 55, 24))
         content.addSubview_(self._custom_rrand)
 
@@ -437,7 +471,22 @@ class AppDelegate(NSObject):
 
     @objc.python_method
     def _cfg_path(self) -> str:
-        return str(self._cfg_path_field.stringValue()).strip()
+        s = str(self._cfg_path_field.stringValue()).strip() if self._cfg_path_field is not None else ""
+        if not s:
+            s = self._app.default_config_path()
+            if self._cfg_path_field is not None:
+                self._cfg_path_field.setStringValue_(s)
+            return s
+
+        # Finder 双击启动 .app 时，cwd 通常会落在 Contents/Resources。
+        # 为避免用户输入相对路径导致误读/误写到 .app 内，这里将相对路径统一解析到用户配置目录。
+        p = Path(s).expanduser()
+        if not p.is_absolute():
+            base = Path(self._app.default_config_path()).expanduser().parent
+            s = str((base / p).resolve())
+            if self._cfg_path_field is not None:
+                self._cfg_path_field.setStringValue_(s)
+        return s
 
     @objc.python_method
     def _selected_profile(self) -> Optional[str]:
@@ -510,6 +559,18 @@ class AppDelegate(NSObject):
             self._global_camera_lock_key.setStringValue_(str(g.get("cameraLockKey") or "CapsLock"))
         if self._global_backpack_key is not None:
             self._global_backpack_key.setStringValue_(str(g.get("backpackKey") or "Tab"))
+        if self._global_move_up_key is not None:
+            self._global_move_up_key.setStringValue_(str(g.get("moveUpKey") or "W"))
+        if self._global_move_down_key is not None:
+            self._global_move_down_key.setStringValue_(str(g.get("moveDownKey") or "S"))
+        if self._global_move_left_key is not None:
+            self._global_move_left_key.setStringValue_(str(g.get("moveLeftKey") or "A"))
+        if self._global_move_right_key is not None:
+            self._global_move_right_key.setStringValue_(str(g.get("moveRightKey") or "D"))
+        if self._global_fire_key is not None:
+            self._global_fire_key.setStringValue_(str(g.get("fireKey") or "MouseLeft"))
+        if self._global_scope_key is not None:
+            self._global_scope_key.setStringValue_(str(g.get("scopeKey") or "MouseRight"))
         if self._global_rrand_default is not None:
             self._global_rrand_default.setStringValue_(str(g.get("rrandDefaultPx") if g.get("rrandDefaultPx") is not None else 0))
 
@@ -521,8 +582,19 @@ class AppDelegate(NSObject):
         if not isinstance(points, dict):
             points = {}
 
+        legacy_points = {
+            "joystickCenter": "C",
+            "cameraAnchor": "A",
+            "fire": "F",
+            "scope": "S",
+            "backpack": "I",
+        }
         for k, (fx, fy) in self._point_fields.items():
             pt = points.get(k)
+            if pt is None:
+                old = legacy_points.get(k)
+                if old:
+                    pt = points.get(old)
             if isinstance(pt, (list, tuple)) and len(pt) == 2:
                 fx.setStringValue_(str(pt[0]))
                 fy.setStringValue_(str(pt[1]))
@@ -583,6 +655,18 @@ class AppDelegate(NSObject):
             g["cameraLockKey"] = str(self._global_camera_lock_key.stringValue()).strip() or "CapsLock"
         if self._global_backpack_key is not None:
             g["backpackKey"] = str(self._global_backpack_key.stringValue()).strip() or "Tab"
+        if self._global_move_up_key is not None:
+            g["moveUpKey"] = str(self._global_move_up_key.stringValue()).strip() or "W"
+        if self._global_move_down_key is not None:
+            g["moveDownKey"] = str(self._global_move_down_key.stringValue()).strip() or "S"
+        if self._global_move_left_key is not None:
+            g["moveLeftKey"] = str(self._global_move_left_key.stringValue()).strip() or "A"
+        if self._global_move_right_key is not None:
+            g["moveRightKey"] = str(self._global_move_right_key.stringValue()).strip() or "D"
+        if self._global_fire_key is not None:
+            g["fireKey"] = str(self._global_fire_key.stringValue()).strip() or "MouseLeft"
+        if self._global_scope_key is not None:
+            g["scopeKey"] = str(self._global_scope_key.stringValue()).strip() or "MouseRight"
         if self._global_rrand_default is not None:
             g["rrandDefaultPx"] = self._safe_float(self._global_rrand_default, 0.0)
 
@@ -599,6 +683,9 @@ class AppDelegate(NSObject):
             x = self._safe_float(fx, 0.0)
             y = self._safe_float(fy, 0.0)
             points[k] = [x, y]
+        # 清理旧命名，避免同时存在两套字段导致混淆
+        for old in ("C", "A", "F", "S", "I"):
+            points.pop(old, None)
 
         joystick = p.get("joystick")
         if not isinstance(joystick, dict):
@@ -665,7 +752,7 @@ class AppDelegate(NSObject):
             pt = m.get("point")
             hold = m.get("tapHoldMs", 30)
             rrand = m.get("rrandPx", None)
-            lines.append(f"{i}. {name} | key={key} | point={pt} | hold={hold} | rrand={rrand}")
+            lines.append(f"{i}. {name} | 按键={key} | 坐标={pt} | 按压={hold}ms | 随机={rrand}")
         self._custom_list.setStringValue_("\n".join(lines) if lines else "(空)")
 
     # --------------------
@@ -824,7 +911,7 @@ class AppDelegate(NSObject):
         for i, p in enumerate(profiles):
             if not isinstance(p, dict):
                 continue
-            nm = str(p.get("name") or f"Profile {i+1}")
+            nm = str(p.get("name") or f"配置档 {i+1}")
             names.append(nm)
             p["name"] = nm
 
@@ -878,7 +965,7 @@ class AppDelegate(NSObject):
             self._alert("无法填入", "请先点击“取点（点击）”获取坐标。")
             return
         tag = int(sender.tag())
-        keys = ["C", "A", "F", "S", "I"]
+        keys = ["joystickCenter", "cameraAnchor", "fire", "scope", "backpack"]
         if tag < 0 or tag >= len(keys):
             return
         key = keys[tag]
@@ -994,7 +1081,11 @@ class AppDelegate(NSObject):
     def onTimer_(self, _timer) -> None:
         snap = self._app.snapshot()
         if not snap.get("running"):
-            self._lbl_status.setStringValue_("状态：未启动")
+            self._lbl_status.setStringValue_(
+                "状态：未启动\n"
+                "提示：首次运行请在系统设置 → 隐私与安全性中开启“输入监控”和“辅助功能”权限；"
+                "点位坐标使用屏幕全局坐标；MouseLeft/MouseRight 表示鼠标左右键。"
+            )
             self._btn_start.setEnabled_(True)
             self._btn_stop.setEnabled_(False)
             return
@@ -1002,12 +1093,18 @@ class AppDelegate(NSObject):
         self._btn_start.setEnabled_(False)
         self._btn_stop.setEnabled_(True)
 
+        def yn(v: object) -> str:
+            return "是" if bool(v) else "否"
+
+        mode_map = {"paused": "暂停", "battle": "战斗", "free": "自由鼠标"}
+        mode_cn = mode_map.get(str(snap.get("mode") or ""), str(snap.get("mode") or ""))
+
         txt = (
-            f"状态：运行中\n"
-            f"config: {snap.get('config')}\n"
-            f"profile: {snap.get('profile')}\n"
-            f"mode: {snap.get('mode')} | target_active: {snap.get('target_active')}\n"
-            f"enabled: {snap.get('mapping_enabled')} | camera_lock: {snap.get('camera_lock')} | backpack: {snap.get('backpack_open')}"
+            "状态：运行中\n"
+            f"配置文件：{snap.get('config')}\n"
+            f"配置档：{snap.get('profile')}\n"
+            f"模式：{mode_cn} | 目标窗口在前台：{yn(snap.get('target_active'))}\n"
+            f"启用映射：{yn(snap.get('mapping_enabled'))} | 视角锁定：{yn(snap.get('camera_lock'))} | 背包打开：{yn(snap.get('backpack_open'))}"
         )
         self._lbl_status.setStringValue_(txt)
 

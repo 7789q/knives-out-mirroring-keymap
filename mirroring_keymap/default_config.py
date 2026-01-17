@@ -16,17 +16,23 @@ DEFAULT_CONFIG_JSON = """\
     "panicHotkey": "F12",
     "cameraLockKey": "CapsLock",
     "backpackKey": "Tab",
+    "moveUpKey": "W",
+    "moveDownKey": "S",
+    "moveLeftKey": "A",
+    "moveRightKey": "D",
+    "fireKey": "MouseLeft",
+    "scopeKey": "MouseRight",
     "rrandDefaultPx": 0
   },
   "profiles": [
     {
-      "name": "Default",
+      "name": "默认",
       "points": {
-        "C": [200, 200],
-        "A": [800, 400],
-        "F": [950, 260],
-        "S": [1010, 260],
-        "I": [980, 680]
+        "joystickCenter": [200, 200],
+        "cameraAnchor": [800, 400],
+        "fire": [950, 260],
+        "scope": [1010, 260],
+        "backpack": [980, 680]
       },
       "joystick": { "radiusPx": 120, "tauMs": 60, "rrandPx": null },
       "camera": {
@@ -49,8 +55,7 @@ DEFAULT_CONFIG_JSON = """\
     }
   ],
   "customMappings": [
-    { "name": "Use", "key": "E", "type": "tap", "point": [820, 300], "tapHoldMs": 30, "rrandPx": 2 }
+    { "name": "交互/拾取", "key": "E", "type": "tap", "point": [820, 300], "tapHoldMs": 30, "rrandPx": 2 }
   ]
 }
 """
-

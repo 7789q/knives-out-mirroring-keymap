@@ -36,6 +36,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 "panicHotkey": cfg.global_.panicHotkey,
                 "cameraLockKey": cfg.global_.cameraLockKey,
                 "backpackKey": cfg.global_.backpackKey,
+                "moveUpKey": cfg.global_.moveUpKey,
+                "moveDownKey": cfg.global_.moveDownKey,
+                "moveLeftKey": cfg.global_.moveLeftKey,
+                "moveRightKey": cfg.global_.moveRightKey,
+                "fireKey": cfg.global_.fireKey,
+                "scopeKey": cfg.global_.scopeKey,
                 "rrandDefaultPx": cfg.global_.rrandDefaultPx,
             },
             "profile": profile.name,
@@ -137,7 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="mirroring-keymap")
     p.add_argument("--log-level", default="INFO", help="日志等级（DEBUG/INFO/WARN/ERROR）")
     p.add_argument("--config", default="config.json", help="配置文件路径（JSON）")
-    p.add_argument("--profile", default=None, help="使用的 Profile 名称（默认第一个）")
+    p.add_argument("--profile", default=None, help="使用的配置档名称（默认第一个）")
     p.add_argument("--run", action="store_true", help="启用捕获/注入（危险：会吞输入）")
     p.add_argument("--dry-run", action="store_true", help="只解析配置并打印，不做捕获/注入")
     p.add_argument("cmd", nargs="?", default="run", choices=["run", "pick"], help="子命令（默认 run）")

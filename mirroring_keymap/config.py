@@ -32,6 +32,14 @@ class GlobalConfig:
     panicHotkey: str = "F12"
     cameraLockKey: str = "CapsLock"
     backpackKey: str = "Tab"
+    # 移动摇杆方向键（默认 WASD）
+    moveUpKey: str = "W"
+    moveDownKey: str = "S"
+    moveLeftKey: str = "A"
+    moveRightKey: str = "D"
+    # 开火/开镜触发键：支持 "MouseLeft"/"MouseRight" 或任意键名（例如 "J"）
+    fireKey: str = "MouseLeft"
+    scopeKey: str = "MouseRight"
     rrandDefaultPx: float = 0.0
 
 
@@ -139,6 +147,12 @@ def load_config(path: str | Path) -> AppConfig:
         panicHotkey=str(g.get("panicHotkey") or "F12"),
         cameraLockKey=str(g.get("cameraLockKey") or "CapsLock"),
         backpackKey=str(g.get("backpackKey") or "Tab"),
+        moveUpKey=str(g.get("moveUpKey") or "W"),
+        moveDownKey=str(g.get("moveDownKey") or "S"),
+        moveLeftKey=str(g.get("moveLeftKey") or "A"),
+        moveRightKey=str(g.get("moveRightKey") or "D"),
+        fireKey=str(g.get("fireKey") or "MouseLeft"),
+        scopeKey=str(g.get("scopeKey") or "MouseRight"),
         rrandDefaultPx=float(g.get("rrandDefaultPx") or 0.0),
     )
 
@@ -150,18 +164,35 @@ def load_config(path: str | Path) -> AppConfig:
     for i, pr in enumerate(profiles_raw):
         if not isinstance(pr, dict):
             raise ValueError(f"profiles[{i}] 必须是对象")
-        name = str(pr.get("name") or f"Profile {i+1}")
+        name = str(pr.get("name") or f"配置档 {i+1}")
 
         points_raw = pr.get("points") or {}
         if not isinstance(points_raw, dict):
             raise ValueError(f"profiles[{i}].points 必须是对象")
         points: dict[str, Point] = {}
-        for k in ("C", "A", "F", "S", "I"):
-            if k in points_raw:
-                points[k] = _as_point(points_raw[k], field=f"profiles[{i}].points.{k}")
-        missing = [k for k in ("C", "A", "F", "S", "I") if k not in points]
-        if missing:
-            raise ValueError(f"profiles[{i}].points 缺少点位: {', '.join(missing)}")
+        # points 命名（向后兼容）：
+        # - 新版（推荐）：joystickCenter / cameraAnchor / fire / scope / backpack
+        # - 旧版兼容：C / A / F / S / I
+        point_defs: list[tuple[str, tuple[str, ...], str]] = [
+            ("joystickCenter", ("joystickCenter", "C"), "摇杆中心"),
+            ("cameraAnchor", ("cameraAnchor", "A"), "视角锚点"),
+            ("fire", ("fire", "F"), "开火点击"),
+            ("scope", ("scope", "S"), "开镜点击"),
+            ("backpack", ("backpack", "I"), "背包按钮"),
+        ]
+        missing_labels: list[str] = []
+        for new_key, aliases, label in point_defs:
+            v = None
+            for a in aliases:
+                if a in points_raw:
+                    v = _as_point(points_raw[a], field=f"profiles[{i}].points.{new_key}")
+                    break
+            if v is None:
+                missing_labels.append(f"{new_key}（{label}）")
+            else:
+                points[new_key] = v
+        if missing_labels:
+            raise ValueError(f"profiles[{i}].points 缺少点位: {', '.join(missing_labels)}")
 
         joystick_raw = pr.get("joystick") or {}
         camera_raw = pr.get("camera") or {}
@@ -257,4 +288,3 @@ def select_profile(cfg: AppConfig, name: Optional[str]) -> ProfileConfig:
         if p.name == name:
             return p
     raise ValueError(f"未找到 profile: {name}")
-

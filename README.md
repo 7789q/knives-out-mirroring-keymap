@@ -36,7 +36,7 @@ cp config.example.json config.json
 mirroring-keymap --config config.json --dry-run
 ```
 
-3) 取点（点击一次屏幕，打印坐标；用于填配置里的 C/A/F/S/I 等点位）：
+3) 取点（点击一次屏幕，打印坐标；用于填配置里的摇杆中心/视角锚点/开火/开镜/背包按钮等点位）：
 
 ```bash
 mirroring-keymap pick
@@ -66,7 +66,7 @@ open dist/MirroringKeymap.app
 
 首次启动 UI 时，会在 `~/Library/Application Support/MirroringKeymap/config.json` 自动生成一份默认配置（点位为占位值），你可以在 UI 里点“打开”直接编辑。
 
-UI 支持直接修改常用参数并保存（Profile 点位/部分手感参数/全局热键），也支持在“自定义点击”里新增多条 `按键 -> 点击坐标` 映射。
+UI 支持直接修改常用参数并保存（配置档点位/部分手感参数/全局热键），也支持在“自定义点击”里新增多条 `按键 -> 点击坐标` 映射。
 
 ## 坐标说明
 
