@@ -381,7 +381,20 @@ class AppDelegate(NSObject):
         self._window.setTitle_("荒野行动按键映射（MVP）")
         self._window.center()
 
-        content = self._window.contentView()
+        # 主界面支持低分辨率：整个窗口内容放进 ScrollView，避免缩小时控件不可见。
+        base = self._window.contentView()
+        main_scroll = NSScrollView.alloc().initWithFrame_(base.bounds())
+        main_scroll.setHasVerticalScroller_(True)
+        main_scroll.setHasHorizontalScroller_(True)
+        try:
+            main_scroll.setAutohidesScrollers_(True)
+        except Exception:
+            pass
+        main_scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+
+        content = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 920, 650))
+        main_scroll.setDocumentView_(content)
+        self._window.setContentView_(main_scroll)
 
         def _label(text: str, x: float, y: float, w: float, h: float = 22) -> NSTextField:
             lbl = NSTextField.alloc().initWithFrame_(NSMakeRect(x, y, w, h))
