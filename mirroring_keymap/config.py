@@ -59,7 +59,10 @@ class CameraConfig:
     tcamPx: float = 3.0
     radiusPx: float = 80.0
     invertY: bool = False
-    sensitivity: float = 1.0
+    # 视角拖动“阈值/平滑度”：
+    # - 引擎会把鼠标累计位移按该阈值分段消耗（每次最多消耗 thresholdPx）
+    # - 阈值越小越丝滑（但转动更慢）；阈值越大越灵敏（但更容易突兀）
+    thresholdPx: float = 10.0
     rrandPx: Optional[float] = None
 
 
@@ -217,7 +220,13 @@ def load_config(path: str | Path) -> AppConfig:
             tcamPx=float(camera_raw.get("tcamPx") or 3.0),
             radiusPx=float(camera_raw.get("radiusPx") or 80.0),
             invertY=bool(camera_raw.get("invertY") or False),
-            sensitivity=float(camera_raw.get("sensitivity") or 1.0),
+            thresholdPx=float(
+                # 新字段：thresholdPx
+                camera_raw.get("thresholdPx")
+                # 兼容旧字段：sensitivity（将其映射为阈值倍率）
+                if camera_raw.get("thresholdPx") is not None
+                else (float(camera_raw.get("sensitivity") or 1.0) * 10.0)
+            ),
             rrandPx=(float(camera_raw["rrandPx"]) if camera_raw.get("rrandPx") is not None else None),
         )
         fire = ActionConfig(

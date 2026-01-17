@@ -239,6 +239,7 @@ class AppDelegate(NSObject):
 
         self._pick_tap = None
         self._last_pick = None
+        self._key_capture = None  # (tap, src, target_field)
 
         # 配置编辑控件引用
         self._cfg_dict = None
@@ -258,7 +259,7 @@ class AppDelegate(NSObject):
         self._point_fields = {}  # {"C": (xField, yField), ...}
 
         self._joy_radius = None
-        self._cam_sens = None
+        self._cam_thresh = None
         self._cam_invert = None
         self._cam_tcam = None
         self._cam_radius = None
@@ -578,9 +579,9 @@ class AppDelegate(NSObject):
         self._joy_radius = NSTextField.alloc().initWithFrame_(NSMakeRect(115, 360, 90, 24))
         doc_params.addSubview_(self._joy_radius)
 
-        doc_params.addSubview_(_label("视角灵敏度", 235, 365, 80))
-        self._cam_sens = NSTextField.alloc().initWithFrame_(NSMakeRect(315, 360, 70, 24))
-        doc_params.addSubview_(self._cam_sens)
+        doc_params.addSubview_(_label("视角阈值(px)", 235, 365, 80))
+        self._cam_thresh = NSTextField.alloc().initWithFrame_(NSMakeRect(315, 360, 70, 24))
+        doc_params.addSubview_(self._cam_thresh)
 
         self._cam_invert = NSButton.alloc().initWithFrame_(NSMakeRect(405, 360, 120, 24))
         self._cam_invert.setButtonType_(NSButtonTypeSwitch)
@@ -698,7 +699,14 @@ class AppDelegate(NSObject):
         self._custom_key = NSTextField.alloc().initWithFrame_(NSMakeRect(315, 340, 90, 24))
         doc_custom.addSubview_(self._custom_key)
 
-        btn_add = NSButton.alloc().initWithFrame_(NSMakeRect(420, 339, 120, 26))
+        btn_capture_key = NSButton.alloc().initWithFrame_(NSMakeRect(410, 339, 60, 26))
+        btn_capture_key.setTitle_("录入")
+        btn_capture_key.setBezelStyle_(NSBezelStyleRounded)
+        btn_capture_key.setTarget_(self)
+        btn_capture_key.setAction_("onCaptureCustomKey:")
+        doc_custom.addSubview_(btn_capture_key)
+
+        btn_add = NSButton.alloc().initWithFrame_(NSMakeRect(475, 339, 120, 26))
         btn_add.setTitle_("添加/替换")
         btn_add.setBezelStyle_(NSBezelStyleRounded)
         btn_add.setTarget_(self)
@@ -1071,8 +1079,15 @@ class AppDelegate(NSObject):
 
         if self._joy_radius is not None:
             self._joy_radius.setStringValue_(str(joystick.get("radiusPx") if joystick.get("radiusPx") is not None else 120))
-        if self._cam_sens is not None:
-            self._cam_sens.setStringValue_(str(camera.get("sensitivity") if camera.get("sensitivity") is not None else 1.0))
+        if self._cam_thresh is not None:
+            # 新字段：thresholdPx；兼容旧字段 sensitivity（映射到阈值倍率）
+            thr = camera.get("thresholdPx")
+            if thr is None and camera.get("sensitivity") is not None:
+                try:
+                    thr = float(camera.get("sensitivity")) * 10.0
+                except Exception:
+                    thr = None
+            self._cam_thresh.setStringValue_(str(thr if thr is not None else 10.0))
         if self._cam_invert is not None:
             self._cam_invert.setState_(1 if bool(camera.get("invertY")) else 0)
         if self._cam_tcam is not None:
@@ -1188,8 +1203,10 @@ class AppDelegate(NSObject):
 
         if self._joy_radius is not None:
             joystick["radiusPx"] = self._safe_float(self._joy_radius, 120.0)
-        if self._cam_sens is not None:
-            camera["sensitivity"] = self._safe_float(self._cam_sens, 1.0)
+        if self._cam_thresh is not None:
+            camera["thresholdPx"] = self._safe_float(self._cam_thresh, 10.0)
+            # 清理旧字段，避免混淆
+            camera.pop("sensitivity", None)
         if self._cam_invert is not None:
             camera["invertY"] = bool(self._cam_invert.state())
         if self._cam_tcam is not None:
@@ -1444,6 +1461,95 @@ class AppDelegate(NSObject):
         self._pick_tap = (tap, src)
 
         self._lbl_pick.setStringValue_("请在屏幕上点击一次以取点…")
+
+    def onCaptureCustomKey_(self, _sender) -> None:
+        """
+        自定义点击的“按键录入”：
+        点击“录入”后按下一次键盘按键，自动写入到自定义按键输入框。
+        """
+        if self._custom_key is None:
+            return
+        if self._key_capture is not None:
+            return
+        try:
+            import Quartz
+        except Exception as e:
+            self._alert("录入失败", f"无法导入 Quartz：{e}")
+            return
+
+        from mirroring_keymap.macos.keycodes import name_for_keycode
+
+        def _stop_capture() -> None:
+            try:
+                tap, src, _field = self._key_capture  # type: ignore[misc]
+            except Exception:
+                return
+            try:
+                Quartz.CGEventTapEnable(tap, False)
+            except Exception:
+                pass
+            try:
+                Quartz.CFRunLoopRemoveSource(Quartz.CFRunLoopGetCurrent(), src, Quartz.kCFRunLoopCommonModes)
+            except Exception:
+                pass
+            self._key_capture = None
+
+        def _cb(_proxy, event_type, event, _refcon):
+            if event_type == Quartz.kCGEventKeyDown:
+                kc = int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode))
+                key_name = name_for_keycode(kc)
+                if not key_name:
+                    self._alert("录入失败", f"该按键暂不支持（keycode={kc}）。请换一个常用按键，或手动输入。")
+                    _stop_capture()
+                    return event
+                # Escape 作为取消键，不写入
+                if key_name == "Escape":
+                    _stop_capture()
+                    return event
+                try:
+                    self._custom_key.setStringValue_(key_name)
+                    # 解除焦点，避免输入框一直被占用
+                    try:
+                        if self._window is not None:
+                            self._window.makeFirstResponder_(None)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                _stop_capture()
+                return event
+
+            # 允许用户用鼠标点回窗口，但不支持鼠标键作为自定义触发键
+            if event_type in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventRightMouseDown):
+                self._alert("录入提示", "自定义点击暂不支持鼠标键，请按键盘按键。")
+                _stop_capture()
+                return event
+
+            return event
+
+        mask = 0
+        for et in (Quartz.kCGEventKeyDown, Quartz.kCGEventLeftMouseDown, Quartz.kCGEventRightMouseDown):
+            mask |= 1 << et
+        tap = Quartz.CGEventTapCreate(
+            Quartz.kCGHIDEventTap,
+            Quartz.kCGHeadInsertEventTap,
+            Quartz.kCGEventTapOptionListenOnly,
+            mask,
+            _cb,
+            None,
+        )
+        if tap is None:
+            self._alert("录入失败", "创建 EventTap 失败：请检查 Input Monitoring / Accessibility 权限。")
+            return
+        src = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
+        Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), src, Quartz.kCFRunLoopCommonModes)
+        Quartz.CGEventTapEnable(tap, True)
+        self._key_capture = (tap, src, self._custom_key)
+
+        try:
+            self._lbl_pick.setStringValue_("按键录入：请按下要绑定的按键（按 Esc 取消）…")
+        except Exception:
+            pass
 
     @objc.python_method
     def _on_picked(self, x: float, y: float) -> None:

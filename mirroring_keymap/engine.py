@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import random
 import threading
@@ -48,6 +49,12 @@ class WheelSession:
     touch_pos: Optional[Point] = None
     last_wheel_ts: float = 0.0
     pending_steps: int = 0  # 累积滚轮步数（正负）
+
+
+@dataclass
+class JoystickSession:
+    active: bool = False
+    touch_pos: Optional[Point] = None
 
 
 class Engine:
@@ -98,6 +105,7 @@ class Engine:
         self._mouse_dy_acc: float = 0.0
         self._tap_queue: Deque[TapRequest] = deque()
         self._wheel = WheelSession()
+        self._joy_session = JoystickSession()
 
         # 运行状态（由调度线程更新）
         self._mapping_enabled: bool = False
@@ -110,6 +118,8 @@ class Engine:
 
         self._last_camera_ts: float = 0.0
         self._last_joystick_ts: float = 0.0
+        # 为了让摇杆在游戏端更稳定生效，需要在“切到视角/开火”前至少保持一小段按住窗口。
+        self._joy_hold_until_ts: float = 0.0
         self._target_check_ts: float = 0.0
 
         self._battle_cursor_snap: Optional[CursorSnapshot] = None
@@ -752,14 +762,21 @@ class Engine:
         camera_due = (now - self._last_camera_ts) >= camera_interval and (abs(mouse_dx) + abs(mouse_dy)) > 0.0
         joy_due = (now - self._last_joystick_ts) >= joy_interval and want_move
 
-        # 若两者都 due，优先服务更紧急的（按 overdue 比例）
+        # 如果摇杆刚刚被按住更新，优先保持一小段时间让游戏端“吃到”触点，
+        # 避免 camera 频繁抢占导致摇杆完全不生效。
+        if want_move and now < float(self._joy_hold_until_ts):
+            camera_due = False
+
+        # 若两者都 due：
+        # 旧策略使用“按比例 overdue”会导致 camera 因 interval 更短而长期抢占，摇杆几乎得不到服务（表现为 WASD 无反应）。
+        # 这里改为“绝对等待时间”优先，确保 joystickMinHz 真实生效。
         if camera_due and joy_due:
-            cam_over = (now - self._last_camera_ts) / camera_interval
-            joy_over = (now - self._last_joystick_ts) / joy_interval
-            if cam_over >= joy_over:
-                self._service_camera(mouse_dx, mouse_dy)
-            else:
+            cam_wait = now - self._last_camera_ts
+            joy_wait = now - self._last_joystick_ts
+            if joy_wait >= cam_wait:
                 self._service_joystick(keys_down)
+            else:
+                self._service_camera(mouse_dx, mouse_dy)
             return
 
         if camera_due:
@@ -772,13 +789,15 @@ class Engine:
 
         # 不 due 时：如果有鼠标输入，依然尽快服务 camera（更贴手）
         tcam = float(self._profile.camera.tcamPx)
-        if abs(mouse_dx) + abs(mouse_dy) >= tcam:
+        if (not want_move or now >= float(self._joy_hold_until_ts)) and (abs(mouse_dx) + abs(mouse_dy) >= tcam):
             self._service_camera(mouse_dx, mouse_dy)
             return
 
-        # 否则如果在移动，则服务 joystick
+        # 否则如果在移动，则服务 joystick；若已停止移动，则释放摇杆按住，避免残留
         if want_move:
             self._service_joystick(keys_down)
+        else:
+            self._release_joystick_hold()
 
     def _service_tap(self, req: TapRequest) -> None:
         # Tap 前先抬起，避免与 drag 状态混淆
@@ -811,15 +830,41 @@ class Engine:
 
     def _service_camera(self, dx: float, dy: float) -> None:
         # 以 A 为锚点做一次短拖动：down -> drag -> up
-        with self._lock:
-            self._mouse_dx_acc = 0.0
-            self._mouse_dy_acc = 0.0
+        # 为了更丝滑：
+        # - 不再用“灵敏度倍乘”一次性消耗所有鼠标 delta（会导致突兀）
+        # - 改为按 camera.thresholdPx 分段消耗，剩余 delta 留到下一帧继续服务
+        self._release_joystick_hold()
 
         cam = self._profile.camera
         a = self._profile.points["cameraAnchor"]
 
-        sx = dx * float(cam.sensitivity)
-        sy = dy * float(cam.sensitivity) * (-1.0 if cam.invertY else 1.0)
+        # 重新读取累计值（避免参数滞后/并发更新）
+        with self._lock:
+            dx = float(self._mouse_dx_acc)
+            dy = float(self._mouse_dy_acc)
+
+        # 小抖动死区
+        if (abs(dx) + abs(dy)) < float(cam.tcamPx):
+            return
+
+        # 单次最多消耗 thresholdPx 的鼠标位移（阈值越小越丝滑）
+        thr = max(1e-3, float(getattr(cam, "thresholdPx", 10.0)))
+        l = math.hypot(dx, dy)
+        if l > thr:
+            s = thr / l
+            use_dx = dx * s
+            use_dy = dy * s
+        else:
+            use_dx = dx
+            use_dy = dy
+
+        # 扣减已消耗的输入，剩余的下一帧继续处理
+        with self._lock:
+            self._mouse_dx_acc -= use_dx
+            self._mouse_dy_acc -= use_dy
+
+        sx = use_dx
+        sy = use_dy * (-1.0 if cam.invertY else 1.0)
 
         # 限幅
         r = float(cam.radiusPx)
@@ -842,10 +887,10 @@ class Engine:
 
         try:
             self._inj.left_down(a)
-            # 过短的按下/拖动在 iPhone Mirroring/游戏侧可能被过滤；给一个很小的按下窗口。
-            time.sleep(0.01)
-            self._inj.drag_smooth(a, end, max_step_px=self._profile.scheduler.maxStepPx, step_delay_s=0.001)
-            time.sleep(0.01)
+            # 给极小的按下窗口，让“按住拖动”更稳定；同时避免过长 sleep 影响调度（摇杆会饿死）。
+            time.sleep(0.003)
+            self._inj.drag_smooth(a, end, max_step_px=self._profile.scheduler.maxStepPx, step_delay_s=0.0)
+            time.sleep(0.002)
             self._inj.left_up(end)
             self._last_camera_ts = time.monotonic()
         except Exception:
@@ -867,6 +912,10 @@ class Engine:
         if self._kc_move_right in keys_down:
             vx += 1.0
         v = normalize((vx, vy))
+        if abs(v[0]) + abs(v[1]) <= 1e-9:
+            # 没有方向输入：释放摇杆按住
+            self._release_joystick_hold()
+            return
         target = add(c, scale(v, float(joy.radiusPx)))
 
         # 覆盖层可视化：WASD（或自定义移动键）对应的摇杆目标点
@@ -884,21 +933,63 @@ class Engine:
                 pressed_until_ts=now + 0.35,
             )
 
+        # 摇杆需要“按住拖动并保持”才能稳定生效；不能每次 down->drag->up（会被游戏判定无效）。
+        with self._lock:
+            active = bool(self._joy_session.active)
+            cur = self._joy_session.touch_pos
+
         try:
-            self._inj.left_down(c)
-            time.sleep(0.01)
-            self._inj.drag_smooth(c, target, max_step_px=self._profile.scheduler.maxStepPx, step_delay_s=0.001)
-            # 轻微停留，避免 iPhone Mirroring/游戏端把过短触碰当作无效
-            hold_s = max(0.03, float(joy.tauMs) / 1000.0)
-            hold_s = min(0.12, hold_s)
-            time.sleep(hold_s)
-            self._inj.left_up(target)
+            if not active or cur is None:
+                # 重新开始一次摇杆按住
+                self._inj.left_down(c)
+                time.sleep(0.004)
+                self._inj.drag_smooth(c, target, max_step_px=self._profile.scheduler.maxStepPx, step_delay_s=0.0)
+            else:
+                # 更新方向：从上一次触点位置拖到新目标（保持按住）
+                self._inj.drag_smooth(cur, target, max_step_px=self._profile.scheduler.maxStepPx, step_delay_s=0.0)
+
+            with self._lock:
+                self._joy_session.active = True
+                self._joy_session.touch_pos = target
             self._last_joystick_ts = now
+            # 设定最小保持窗口（使用 tauMs 作为“手感保持”参数）
+            hold_s = max(0.02, min(0.09, float(joy.tauMs) / 1000.0))
+            self._joy_hold_until_ts = time.monotonic() + hold_s
         except Exception:
             self._safe_release_all()
 
+    def _release_joystick_hold(self) -> None:
+        with self._lock:
+            active = bool(self._joy_session.active)
+            pos = self._joy_session.touch_pos
+            self._joy_session = JoystickSession()
+            self._joy_hold_until_ts = 0.0
+        if not active:
+            return
+        try:
+            self._inj.left_up(pos or self._inj.get_cursor_pos())
+        except Exception:
+            pass
+        # 战斗态下保持光标隐藏，避免释放摇杆导致光标闪现
+        try:
+            if self.current_mode() == Mode.BATTLE:
+                self._inj.hide_cursor()
+        except Exception:
+            pass
+
     def _safe_release_all(self) -> None:
+        # 同时清理内部 session 状态，避免“按住残留”
+        with self._lock:
+            self._wheel = WheelSession()
+            self._joy_session = JoystickSession()
+            self._joy_hold_until_ts = 0.0
         try:
             self._inj.release_all()
+        except Exception:
+            pass
+        # 战斗态下不应显示系统光标
+        try:
+            if self.current_mode() == Mode.BATTLE:
+                self._inj.hide_cursor()
         except Exception:
             pass

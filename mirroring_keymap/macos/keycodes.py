@@ -75,6 +75,8 @@ KEYCODES: dict[str, int] = {
     "0": 29,
 }
 
+_KEYCODES_REV: dict[int, str] = {v: k for k, v in KEYCODES.items()}
+
 
 def keycode_for(name: str) -> int:
     key = name.strip()
@@ -83,3 +85,11 @@ def keycode_for(name: str) -> int:
     if key not in KEYCODES:
         raise ValueError(f"未知按键: {name!r}（当前仅支持: {', '.join(sorted(KEYCODES))}）")
     return KEYCODES[key]
+
+
+def name_for_keycode(keycode: int) -> str:
+    """
+    反查 keycode 对应的键名（用于 UI “按键录入”）。
+    若未收录则返回空串，交由调用方提示用户。
+    """
+    return _KEYCODES_REV.get(int(keycode), "")

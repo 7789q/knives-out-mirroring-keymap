@@ -40,7 +40,7 @@ DEFAULT_CONFIG_JSON = """\
         "tcamPx": 3,
         "radiusPx": 80,
         "invertY": false,
-        "sensitivity": 1.0,
+        "thresholdPx": 10.0,
         "rrandPx": null
       },
       "fire": { "mode": "tap", "tapHoldMs": 30, "rrandPx": null },
