@@ -15,8 +15,8 @@ DEFAULT_CONFIG_JSON = """\
   "global": {
     "enableHotkey": "F8",
     "panicHotkey": "F12",
-    "cameraLockKey": "CapsLock",
-    "backpackKey": "Tab",
+    "cameraLockKey": "Tab",
+    "backpackKey": "B",
     "moveUpKey": "W",
     "moveDownKey": "S",
     "moveLeftKey": "A",
@@ -40,7 +40,7 @@ DEFAULT_CONFIG_JSON = """\
         "tcamPx": 3,
         "radiusPx": 80,
         "invertY": false,
-        "thresholdPx": 10.0,
+        "thresholdPx": 6.0,
         "rrandPx": null
       },
       "fire": { "mode": "tap", "tapHoldMs": 30, "rrandPx": null },

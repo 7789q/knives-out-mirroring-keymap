@@ -11,6 +11,23 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Deque, Optional
 
+
+def _secure_input_enabled() -> Optional[bool]:
+    """
+    macOS “安全输入”(Secure Event Input) 开启时，系统会阻止第三方进程读取键盘事件。
+    这会导致 EventTap/轮询都读不到 WASD，从而表现为“摇杆完全无反应”。
+    """
+    try:
+        import ctypes
+        from ctypes import c_bool
+
+        lib = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+        fn = lib.CGSIsSecureEventInputSet
+        fn.restype = c_bool
+        return bool(fn())
+    except Exception:
+        return None
+
 from .config import AppConfig, CustomMapping, Point, ProfileConfig
 from .mathutil import add, normalize, random_point, scale
 from .macos.injector import CursorSnapshot, Injector
@@ -31,6 +48,10 @@ class TapRequest:
     point: Point
     hold_ms: int
     rrand_px: Optional[float]
+    # 背包/菜单类按钮通常需要“抬起后再按一次”才可靠（避免触点被其他 session 占用）
+    pre_release: bool = True
+    # 有些 UI 按钮（例如背包）在刚切换模式/刚释放触点后需要稍微等待一下才稳定命中
+    pre_delay_ms: int = 0
 
 
 @dataclass
@@ -54,7 +75,21 @@ class WheelSession:
 @dataclass
 class JoystickSession:
     active: bool = False
+    center_pos: Optional[Point] = None
     touch_pos: Optional[Point] = None
+    last_ts: float = 0.0
+
+
+@dataclass
+class CameraSession:
+    """
+    视角触点会“按住并小范围拖动”，避免每帧 down->up 导致的突兀/不生效。
+    注意：本工具受“单指限制”，Camera 与 Joystick/Wheel 需要时间片切换。
+    """
+
+    active: bool = False
+    touch_pos: Optional[Point] = None
+    last_drag_ts: float = 0.0
 
 
 class Engine:
@@ -77,7 +112,8 @@ class Engine:
         g = cfg.global_
         self._kc_enable = keycode_for(g.enableHotkey)
         self._kc_panic = keycode_for(g.panicHotkey)
-        self._kc_caps = keycode_for(g.cameraLockKey)
+        self._camera_lock_key_name = str(g.cameraLockKey or "CapsLock").strip() or "CapsLock"
+        self._kc_caps = keycode_for(self._camera_lock_key_name)
         self._kc_backpack = keycode_for(g.backpackKey)
 
         # 移动方向键（默认 WASD，可配置）
@@ -103,9 +139,28 @@ class Engine:
         self._keys_down: set[int] = set()
         self._mouse_dx_acc: float = 0.0
         self._mouse_dy_acc: float = 0.0
+        # 最近一次“真实鼠标移动事件”的时间戳（仅用于诊断/状态机）
+        self._last_mouse_event_ts: float = 0.0
         self._tap_queue: Deque[TapRequest] = deque()
         self._wheel = WheelSession()
         self._joy_session = JoystickSession()
+        self._cam_session = CameraSession()
+        # 视角回中状态：到达边界后先抬起，等待下一段“新的鼠标轨迹”再重新按下，避免回中反向拖动。
+        self._cam_recenter_pending: bool = False
+        self._cam_recenter_pos: Optional[Point] = None
+        self._cam_recenter_mouse_ts0: float = 0.0
+
+        # 键盘状态兜底：部分场景（例如系统安全输入）可能导致 EventTap 收不到键盘事件。
+        # 这里通过轮询 CGEventSourceKeyState 做“WASD/热键/自定义按键”的备用输入源。
+        self._polled_keys_down: set[int] = set()
+        # 仅用于“移动键轮询是否可靠”的判断：只有当轮询曾经检测到过移动键按下，
+        # 才用轮询结果去覆盖 EventTap（否则在轮询失效时会导致 WASD 永远无反应）。
+        self._poll_move_ok: bool = False
+        # 诊断：最近一次捕获到任意键盘事件的时间（monotonic）；用于排查“只收得到鼠标，不收键盘”。
+        self._last_kbd_event_ts: float = 0.0
+        self._poll_prev_down: dict[int, bool] = {}
+        self._action_last_ts: dict[str, float] = {}
+        self._action_lock = threading.Lock()
 
         # 运行状态（由调度线程更新）
         self._mapping_enabled: bool = False
@@ -133,6 +188,7 @@ class Engine:
         # 日志：避免在 tick 循环里刷屏，仅在变化时输出
         self._last_target_active_logged: Optional[bool] = None
         self._ignore_log_last: dict[str, float] = {}
+        self._err_log_last: dict[str, float] = {}
 
         self._stop_evt = threading.Event()
         self._thread = threading.Thread(target=self._run_loop, name="scheduler", daemon=True)
@@ -145,6 +201,148 @@ class Engine:
             return ("mouse", "right")
         # 默认按键名（例如 "J" / "Space" / "UpArrow"）
         return ("key", keycode_for(spec))
+
+    def _action_ok(self, action: str, now: float, *, min_interval_s: float = 0.05) -> bool:
+        """
+        防止同一动作在极短时间内被“EventTap + 轮询兜底”重复触发。
+        """
+        with self._action_lock:
+            last = float(self._action_last_ts.get(action, 0.0))
+            if now - last < float(min_interval_s):
+                return False
+            self._action_last_ts[action] = float(now)
+            return True
+
+    def _warn_throttled(self, key: str, now: float, msg: str, *args: object) -> None:
+        last = float(self._err_log_last.get(key, 0.0))
+        if now - last < 1.0:
+            return
+        self._err_log_last[key] = float(now)
+        self._log.warning(msg, *args)
+
+    def _poll_keyboard(self, now: float) -> None:
+        """
+        轮询键盘按下状态：
+        - 解决某些场景 EventTap 收不到键盘事件导致的“WASD/背包/自定义按键无反应”
+        - 与 EventTap 并存时用 _action_ok 做短去重
+        """
+        try:
+            import Quartz
+        except Exception:
+            # 非 macOS/Quartz 不可用时，禁用轮询兜底
+            self._polled_keys_down = set()
+            return
+
+        # 不同 macOS/输入设备下，CombinedSessionState/HIDSystemState 的表现可能不同。
+        # 为了最大化兼容性，这里同时尝试两种来源（任一为 True 即认为按下）。
+        srcs = (
+            getattr(Quartz, "kCGEventSourceStateCombinedSessionState", None),
+            getattr(Quartz, "kCGEventSourceStateHIDSystemState", None),
+        )
+
+        def _key_state(kc: int) -> bool:
+            for src in srcs:
+                if src is None:
+                    continue
+                try:
+                    if bool(Quartz.CGEventSourceKeyState(src, int(kc))):
+                        return True
+                except Exception:
+                    continue
+            return False
+
+        # 读取当前状态（用于门槛判断）
+        with self._lock:
+            mapping_enabled = bool(self._mapping_enabled)
+            target_active = bool(self._target_active)
+            mode = self._mode
+            cam_lock = bool(self._camera_lock)
+
+        # 1) 移动键（WASD）状态快照：仅用于 Joystick 服务
+        move_kcs = (self._kc_move_up, self._kc_move_down, self._kc_move_left, self._kc_move_right)
+        self._polled_keys_down = {kc for kc in move_kcs if _key_state(kc)}
+        if self._polled_keys_down:
+            self._poll_move_ok = True
+
+        def _edge_down(kc: int) -> bool:
+            down = _key_state(kc)
+            prev = bool(self._poll_prev_down.get(kc, False))
+            self._poll_prev_down[kc] = down
+            return down and not prev
+
+        # 2) 启用/紧急停止热键：允许在未启用映射时也生效（与 EventTap 行为一致）
+        if _edge_down(self._kc_enable) and self._action_ok("hotkey_enable", now):
+            self.set_mapping_enabled(not self.is_mapping_enabled())
+        if _edge_down(self._kc_panic) and self._action_ok("hotkey_panic", now):
+            self.panic()
+
+        # 3) 视角锁定热键（CapsLock 或其他键）
+        cam_down = _key_state(self._kc_caps)
+        prev_cam = bool(self._poll_prev_down.get(self._kc_caps, False))
+        self._poll_prev_down[self._kc_caps] = cam_down
+        # 若“视角锁定键”和“背包键”相同，则只执行背包逻辑（背包内已包含锁定切换），避免双重切换。
+        if self._kc_caps != self._kc_backpack:
+            want_toggle_cam = False
+            if self._camera_lock_key_name == "CapsLock":
+                # CapsLock 是锁定键：按一次会改变“状态”，这里对状态变化做 toggle
+                if cam_down != prev_cam:
+                    want_toggle_cam = True
+            else:
+                # 普通键：仅在按下沿触发一次
+                if cam_down and not prev_cam:
+                    want_toggle_cam = True
+            if want_toggle_cam and mapping_enabled and target_active and self._action_ok("camera_lock", now):
+                self.set_camera_lock(not cam_lock)
+
+        # 4) 背包热键：仅在映射启用且目标激活时生效
+        if _edge_down(self._kc_backpack) and mapping_enabled and target_active and self._action_ok("backpack", now):
+            self.toggle_backpack()
+
+        # 5) 键盘触发的 Tap（开火/开镜/自定义）：在战斗态生效
+        if mapping_enabled and target_active and mode == Mode.BATTLE:
+            # fire/scope
+            t_type, t_val = self._fire_trigger
+            if t_type == "key":
+                kc = int(t_val)
+                if _edge_down(kc) and self._action_ok(f"fire:{kc}", now):
+                    with self._lock:
+                        self._tap_queue.append(
+                            TapRequest(
+                                name="fire",
+                                key_label=self._cfg.global_.fireKey,
+                                point=self._profile.points["fire"],
+                                hold_ms=self._profile.fire.tapHoldMs,
+                                rrand_px=self._profile.fire.rrandPx,
+                            )
+                        )
+            t_type, t_val = self._scope_trigger
+            if t_type == "key":
+                kc = int(t_val)
+                if _edge_down(kc) and self._action_ok(f"scope:{kc}", now):
+                    with self._lock:
+                        self._tap_queue.append(
+                            TapRequest(
+                                name="scope",
+                                key_label=self._cfg.global_.scopeKey,
+                                point=self._profile.points["scope"],
+                                hold_ms=self._profile.scope.tapHoldMs,
+                                rrand_px=self._profile.scope.rrandPx,
+                            )
+                        )
+
+            # customMappings（按下沿触发一次）
+            for kc, m in self._custom_by_keycode.items():
+                if _edge_down(kc) and self._action_ok(f"custom:{kc}", now):
+                    with self._lock:
+                        self._tap_queue.append(
+                            TapRequest(
+                                name=f"custom:{m.key}",
+                                key_label=f"{m.key}:{m.name}" if m.name else m.key,
+                                point=m.point,
+                                hold_ms=m.tapHoldMs,
+                                rrand_px=m.rrandPx,
+                            )
+                        )
 
     # -------------------------
     # Public API
@@ -173,7 +371,15 @@ class Engine:
             return self._mode
 
     def snapshot(self) -> dict[str, object]:
+        def _bit(v: bool) -> int:
+            return 1 if bool(v) else 0
+
+        secure = _secure_input_enabled()
+        now = time.monotonic()
         with self._lock:
+            et = set(self._keys_down)
+            polled = set(self._polled_keys_down)
+            last_kbd_ts = float(self._last_kbd_event_ts)
             return {
                 "mapping_enabled": self._mapping_enabled,
                 "camera_lock": self._camera_lock,
@@ -182,6 +388,21 @@ class Engine:
                 "target_active": self._target_active,
                 "mode": self._mode.value,
                 "accessibility_trusted": self._accessibility_trusted,
+                "poll_move_ok": bool(self._poll_move_ok),
+                "move_eventtap": {
+                    "up": _bit(self._kc_move_up in et),
+                    "left": _bit(self._kc_move_left in et),
+                    "down": _bit(self._kc_move_down in et),
+                    "right": _bit(self._kc_move_right in et),
+                },
+                "move_polled": {
+                    "up": _bit(self._kc_move_up in polled),
+                    "left": _bit(self._kc_move_left in polled),
+                    "down": _bit(self._kc_move_down in polled),
+                    "right": _bit(self._kc_move_right in polled),
+                },
+                "last_kbd_event_age_ms": int(max(0.0, (now - last_kbd_ts) * 1000.0)) if last_kbd_ts > 0.0 else None,
+                "secure_input": secure,
             }
 
     def click_markers(self) -> list[dict[str, object]]:
@@ -244,8 +465,11 @@ class Engine:
                     name="backpack",
                     key_label=self._cfg.global_.backpackKey,
                     point=self._profile.points["backpack"],
-                    hold_ms=self._profile.fire.tapHoldMs,
+                    # 背包按钮通常比开火更需要“按住略久一点”才稳定命中
+                    hold_ms=max(60, int(self._profile.fire.tapHoldMs)),
                     rrand_px=self._cfg.global_.rrandDefaultPx,
+                    pre_release=True,
+                    pre_delay_ms=35,
                 )
             )
         self._log.info("背包 %s", "打开" if opening else "关闭")
@@ -298,47 +522,67 @@ class Engine:
             kc = int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode))
 
             is_down = event_type != Quartz.kCGEventKeyUp
+            prev_down = False
             with self._lock:
+                prev_down = kc in self._keys_down
                 if is_down:
                     self._keys_down.add(kc)
                 else:
                     self._keys_down.discard(kc)
+                self._last_kbd_event_ts = now
 
             if event_type == Quartz.kCGEventKeyDown:
-                if kc == self._kc_enable:
+                try:
+                    autorepeat = int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventAutorepeat))
+                except Exception:
+                    autorepeat = 0
+
+                if kc == self._kc_enable and not autorepeat and self._action_ok("hotkey_enable", now):
                     with self._lock:
                         self._mapping_enabled = not self._mapping_enabled
                         if not self._mapping_enabled:
                             self._camera_lock = False
                             self._backpack_open = False
                     self._log.info("映射 %s", "启用" if self.is_mapping_enabled() else "禁用")
-                elif kc == self._kc_panic:
+                elif kc == self._kc_panic and not autorepeat and self._action_ok("hotkey_panic", now):
                     with self._lock:
                         self._mapping_enabled = False
                         self._camera_lock = False
                         self._backpack_open = False
                     self._log.warning("紧急停止：已禁用映射并请求释放所有按住")
                     self._safe_release_all()
-                elif kc == self._kc_backpack and mapping_enabled and target_active:
-                    # 背包切换：开 -> 强制自由鼠标；关 -> 自动回战斗且开启视角锁定
+                elif (
+                    kc == self._kc_backpack
+                    and not autorepeat
+                    and mapping_enabled
+                    and target_active
+                    and self._action_ok("backpack", now)
+                ):
+                    # 背包切换：开 -> 强制自由鼠标；关 -> 自动回战斗且开启视角锁定；并点击背包坐标
+                    self.toggle_backpack()
+                    swallow = True
+                    return True
+                elif (
+                    # 视角锁定键为普通键（例如 Tab）时，用 keyDown 切换；CapsLock 仍走 flagsChanged。
+                    self._camera_lock_key_name != "CapsLock"
+                    and kc == self._kc_caps
+                    and kc != self._kc_backpack
+                    and not autorepeat
+                    and mapping_enabled
+                    and target_active
+                    and self._action_ok("camera_lock", now)
+                ):
                     with self._lock:
-                        opening = not self._backpack_open
-                        self._backpack_open = opening
-                        self._camera_lock = False if opening else True
-                        self._tap_queue.append(
-                            TapRequest(
-                                name="backpack",
-                                key_label=self._cfg.global_.backpackKey,
-                                point=self._profile.points["backpack"],
-                                hold_ms=self._profile.fire.tapHoldMs,
-                                rrand_px=self._cfg.global_.rrandDefaultPx,
-                            )
-                        )
-                    self._log.info("背包 %s", "打开" if opening else "关闭")
+                        self._camera_lock = not self._camera_lock
+                        if self._camera_lock:
+                            self._backpack_open = False
+                    self._log.info("视角锁定 %s", "开启" if self._camera_lock else "关闭")
+                    swallow = True
+                    return True
                 else:
                     # 内置开火/开镜：若触发键是键盘，则在此处拦截并转为 Tap
                     t_type, t_val = self._fire_trigger
-                    if t_type == "key" and kc == int(t_val):
+                    if t_type == "key" and kc == int(t_val) and not autorepeat and self._action_ok(f"fire:{int(t_val)}", now):
                         if not mapping_enabled:
                             self._log.warning("开火被忽略：映射未启用")
                         elif not target_active:
@@ -361,7 +605,7 @@ class Engine:
                             return True
 
                     t_type, t_val = self._scope_trigger
-                    if t_type == "key" and kc == int(t_val):
+                    if t_type == "key" and kc == int(t_val) and not autorepeat and self._action_ok(f"scope:{int(t_val)}", now):
                         if not mapping_enabled:
                             self._log.warning("开镜被忽略：映射未启用")
                         elif not target_active:
@@ -384,7 +628,7 @@ class Engine:
                             return True
 
                     # 自定义映射（按键→点击）
-                    if event_type == Quartz.kCGEventKeyDown and kc in self._custom_by_keycode:
+                    if not autorepeat and kc in self._custom_by_keycode and self._action_ok(f"custom:{kc}", now):
                         m = self._custom_by_keycode[kc]
                         if not mapping_enabled:
                             self._log.warning("自定义点击「%s」被忽略：映射未启用", m.name)
@@ -407,19 +651,63 @@ class Engine:
 
                 # 移动键提示：很多“WASD 无反应”实际是因为未开启战斗态（视角锁定）或目标未激活
                 if kc in (self._kc_move_up, self._kc_move_down, self._kc_move_left, self._kc_move_right) and mapping_enabled:
+                    # 诊断：记录是否真的收到了 WASD 的 keyDown（只记录首次按下，避免 autorepeat 刷屏）。
+                    if not autorepeat and not prev_down:
+                        try:
+                            g = self._cfg.global_
+                            name = "?"
+                            if kc == self._kc_move_up:
+                                name = str(g.moveUpKey)
+                            elif kc == self._kc_move_down:
+                                name = str(g.moveDownKey)
+                            elif kc == self._kc_move_left:
+                                name = str(g.moveLeftKey)
+                            elif kc == self._kc_move_right:
+                                name = str(g.moveRightKey)
+                            self._log.info("捕获移动键按下：%s (kc=%d)", name, kc)
+                        except Exception:
+                            self._log.info("捕获移动键按下：kc=%d", kc)
                     if not target_active and _throttle("move_key_ignored_target"):
                         self._log.warning("移动键被忽略：目标窗口未激活/未命中（可在配置中关闭目标检测）")
                     elif mode != Mode.BATTLE and _throttle("move_key_ignored_mode"):
                         self._log.warning("移动键被忽略：当前模式=%s（需要开启“视角锁定/战斗模式”）", mode.value)
+            # 诊断：移动键抬起（只记录真实 keyUp）
+            if event_type == Quartz.kCGEventKeyUp and prev_down and kc in (
+                self._kc_move_up,
+                self._kc_move_down,
+                self._kc_move_left,
+                self._kc_move_right,
+            ):
+                try:
+                    g = self._cfg.global_
+                    name = "?"
+                    if kc == self._kc_move_up:
+                        name = str(g.moveUpKey)
+                    elif kc == self._kc_move_down:
+                        name = str(g.moveDownKey)
+                    elif kc == self._kc_move_left:
+                        name = str(g.moveLeftKey)
+                    elif kc == self._kc_move_right:
+                        name = str(g.moveRightKey)
+                    self._log.info("捕获移动键抬起：%s (kc=%d)", name, kc)
+                except Exception:
+                    self._log.info("捕获移动键抬起：kc=%d", kc)
 
             # CapsLock 使用 flagsChanged 更可靠
-            if event_type == Quartz.kCGEventFlagsChanged and kc == self._kc_caps and mapping_enabled and target_active:
+            if (
+                event_type == Quartz.kCGEventFlagsChanged
+                and kc == self._kc_caps
+                and mapping_enabled
+                and target_active
+                and self._action_ok("camera_lock", now)
+            ):
+                new_state = False
                 with self._lock:
                     self._camera_lock = not self._camera_lock
-                    self._log.info("视角锁定 %s", "开启" if self._camera_lock else "关闭")
+                    new_state = bool(self._camera_lock)
                     if self._camera_lock:
                         self._backpack_open = False
-                self._log.info("视角锁定 %s", "开启" if self._camera_lock else "关闭")
+                self._log.info("视角锁定 %s", "开启" if new_state else "关闭")
 
             # 吞吐策略
             if mapping_enabled and target_active and mode == Mode.BATTLE:
@@ -428,9 +716,44 @@ class Engine:
 
         elif event_type in (Quartz.kCGEventMouseMoved, Quartz.kCGEventLeftMouseDragged):
             if mapping_enabled and target_active and mode == Mode.BATTLE:
-                dx = float(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventDeltaX))
-                dy = float(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventDeltaY))
+                # 使用 unaccelerated delta（若可用）以尽量让拖动“DPI/手感”与鼠标一致
+                dx = None
+                dy = None
+                ux_f = getattr(Quartz, "kCGMouseEventUnacceleratedDeltaX", None)
+                uy_f = getattr(Quartz, "kCGMouseEventUnacceleratedDeltaY", None)
+                if ux_f is not None and uy_f is not None:
+                    # 有些系统上 unaccelerated delta 是 double field；这里优先取 double，失败再回退 integer。
+                    try:
+                        dx = float(Quartz.CGEventGetDoubleValueField(event, ux_f))
+                        dy = float(Quartz.CGEventGetDoubleValueField(event, uy_f))
+                    except Exception:
+                        try:
+                            dx = float(Quartz.CGEventGetIntegerValueField(event, ux_f))
+                            dy = float(Quartz.CGEventGetIntegerValueField(event, uy_f))
+                        except Exception:
+                            dx = None
+                            dy = None
+                if dx is None or dy is None:
+                    dx = float(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventDeltaX))
+                    dy = float(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventDeltaY))
+                else:
+                    # 兜底：若 unaccelerated 读到 0 但普通 delta 非 0，则回退普通 delta（避免“移动被吃掉”）。
+                    if dx == 0.0 and dy == 0.0:
+                        try:
+                            dx2 = float(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventDeltaX))
+                            dy2 = float(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventDeltaY))
+                            if dx2 != 0.0 or dy2 != 0.0:
+                                dx = dx2
+                                dy = dy2
+                        except Exception:
+                            pass
                 with self._lock:
+                    # 记录“真实鼠标”移动时间（用于回中状态机）
+                    self._last_mouse_event_ts = now
+                    # 回中待机：此时不采集轨迹（避免把回中的系统抖动/残余移动计入下一段拖动）
+                    if self._cam_recenter_pending:
+                        swallow = True
+                        return True
                     self._mouse_dx_acc += dx
                     self._mouse_dy_acc += dy
                 swallow = True
@@ -580,6 +903,13 @@ class Engine:
                     self._last_target_active_logged = active
                     self._log.info("目标窗口在前台：%s", "是" if active else "否")
 
+        # 键盘轮询兜底：确保在某些 EventTap 收不到键盘事件的场景下仍可工作（WASD/背包/热键/自定义按键）。
+        try:
+            self._poll_keyboard(now)
+        except Exception as e:
+            # 不阻塞主循环
+            self._log.debug("keyboard poll failed: %s", e)
+
         with self._lock:
             mapping_enabled = self._mapping_enabled
             target_active = self._target_active
@@ -656,6 +986,10 @@ class Engine:
 
         # 首次 tick：确定落点并按下
         if touch_pos is None:
+            # 单指限制：滚轮拖动开始前先释放其他按住（camera/joystick）
+            self._release_camera_hold()
+            self._release_joystick_hold()
+
             origin = touch_origin or cursor_origin or self._inj.get_cursor_pos()
             r = self._profile.wheel.rrandPx
             if r is None:
@@ -664,7 +998,7 @@ class Engine:
             try:
                 self._inj.left_down(p0)
             except Exception as e:
-                self._log.debug("wheel down failed: %s", e)
+                self._warn_throttled("wheel_down_failed", now, "滚轮按下失败：%s", e)
                 with self._lock:
                     self._wheel = WheelSession()  # reset
                 # 避免战斗态光标意外显示
@@ -715,7 +1049,8 @@ class Engine:
             with self._lock:
                 if self._wheel.active:
                     self._wheel.touch_pos = target
-        except Exception:
+        except Exception as e:
+            self._warn_throttled("wheel_drag_failed", now, "滚轮拖动失败：%s", e)
             # 出错则重置，避免卡住；同时尽量恢复战斗态光标隐藏状态
             try:
                 self._inj.release_all()
@@ -751,6 +1086,30 @@ class Engine:
             mouse_dx = self._mouse_dx_acc
             mouse_dy = self._mouse_dy_acc
             keys_down = set(self._keys_down)
+
+        # 2.0) 视角回中待机：当到达边界后，我们会先抬起并进入 pending 状态。
+        # 在 pending 期间不采集鼠标轨迹；当检测到“新的鼠标移动事件”到来时，
+        # 才在锚点重新按下，确保后续拖动基于“重新按下后的轨迹”，并避免回中反向拖动。
+        if self._maybe_start_camera_after_recenter(now):
+            return
+        # 兜底：用轮询到的 WASD 状态“纠正” EventTap（避免 keyUp 丢失导致“摇杆卡住”）。
+        # 注意：部分环境 CGEventSourceKeyState 可能始终返回 False（例如权限/安全输入/设备问题）。
+        # 若直接无条件覆盖，会导致 WASD 永远无反应。因此只有在轮询曾经成功检测到移动键时，才信任轮询结果。
+        move_kcs = {self._kc_move_up, self._kc_move_down, self._kc_move_left, self._kc_move_right}
+        eventtap_move = keys_down & move_kcs
+        polled_move = set()
+        try:
+            polled_move = set(self._polled_keys_down)
+        except Exception:
+            polled_move = set()
+        # 轮询用于“纠正 keyUp 丢失导致的卡键”，但在某些环境下可能间歇性为 0。
+        # 若轮询结果为空但 EventTap 仍检测到按下，则必须回退到 EventTap，
+        # 否则会出现“摇杆突然无效/完全无反应”。
+        if self._poll_move_ok and polled_move:
+            move_state = polled_move
+        else:
+            move_state = eventtap_move or polled_move
+        keys_down = (keys_down - move_kcs) | move_state
 
         want_move = any(
             k in keys_down for k in (self._kc_move_up, self._kc_move_down, self._kc_move_left, self._kc_move_right)
@@ -800,8 +1159,12 @@ class Engine:
             self._release_joystick_hold()
 
     def _service_tap(self, req: TapRequest) -> None:
-        # Tap 前先抬起，避免与 drag 状态混淆
-        self._safe_release_all()
+        # Tap 前先抬起，避免与 drag 状态混淆；部分按钮需要短暂等待以提高命中率。
+        if bool(getattr(req, "pre_release", True)):
+            self._safe_release_all()
+        delay_ms = int(getattr(req, "pre_delay_ms", 0) or 0)
+        if delay_ms > 0:
+            time.sleep(max(0.0, float(delay_ms) / 1000.0))
         p = req.point
         r = req.rrand_px
         if r is None:
@@ -829,19 +1192,19 @@ class Engine:
                 pass
 
     def _service_camera(self, dx: float, dy: float) -> None:
-        # 以 A 为锚点做一次短拖动：down -> drag -> up
-        # 为了更丝滑：
-        # - 不再用“灵敏度倍乘”一次性消耗所有鼠标 delta（会导致突兀）
-        # - 改为按 camera.thresholdPx 分段消耗，剩余 delta 留到下一帧继续服务
+        # 视角采用“按住并拖动”（保持一段时间），避免每帧 down->up 造成突兀/无效。
+        # 单指限制：执行视角拖动前需要释放摇杆触点。
         self._release_joystick_hold()
 
         cam = self._profile.camera
-        a = self._profile.points["cameraAnchor"]
+        anchor = self._profile.points["cameraAnchor"]
 
         # 重新读取累计值（避免参数滞后/并发更新）
         with self._lock:
             dx = float(self._mouse_dx_acc)
             dy = float(self._mouse_dy_acc)
+            cam_active = bool(self._cam_session.active)
+            cur = self._cam_session.touch_pos
 
         # 小抖动死区
         if (abs(dx) + abs(dy)) < float(cam.tcamPx):
@@ -866,19 +1229,80 @@ class Engine:
         sx = use_dx
         sy = use_dy * (-1.0 if cam.invertY else 1.0)
 
-        # 限幅
-        r = float(cam.radiusPx)
-        sx = max(-r, min(r, sx))
-        sy = max(-r, min(r, sy))
-        end = (a[0] + sx, a[1] + sy)
+        now = time.monotonic()
 
-        # 覆盖层可视化：视角拖动的目标点
+        # 首次拖动：先在 anchor 处按下并进入“视角按住”session
+        if (not cam_active) or (cur is None):
+            rr = cam.rrandPx
+            if rr is None:
+                rr = self._cfg.global_.rrandDefaultPx
+            p0 = random_point(anchor, float(rr or 0.0), rng=self._rng)
+            try:
+                self._inj.left_down(p0)
+                # 给极小的按下窗口，让“按住拖动”更稳定
+                time.sleep(0.003)
+            except Exception as e:
+                self._warn_throttled("camera_down_failed", now, "视角按下失败：%s", e)
+                self._safe_release_all()
+                return
+            with self._lock:
+                self._cam_session.active = True
+                self._cam_session.touch_pos = p0
+                self._cam_session.last_drag_ts = now
+            cur = p0
+
+        # 计算目标触点位置：从当前触点小幅移动，并限制在 radiusPx 内（围绕 anchor）
+        r = float(cam.radiusPx)
+
+        def _inside_circle(p: Point) -> bool:
+            dx0 = float(p[0]) - float(anchor[0])
+            dy0 = float(p[1]) - float(anchor[1])
+            return (dx0 * dx0 + dy0 * dy0) <= (r * r + 1e-6)
+
+        def _clamp_to_circle(p: Point) -> Point:
+            dx0 = float(p[0]) - float(anchor[0])
+            dy0 = float(p[1]) - float(anchor[1])
+            dist0 = math.hypot(dx0, dy0)
+            if dist0 <= r or dist0 <= 1e-6:
+                return (float(p[0]), float(p[1]))
+            s0 = r / dist0
+            return (float(anchor[0] + dx0 * s0), float(anchor[1] + dy0 * s0))
+
+        cur = _clamp_to_circle(cur)
+        proposed = (float(cur[0] + sx), float(cur[1] + sy))
+
+        # 若触点达到边界：先拖到边界，然后松开 → 回到锚点重新按下。
+        # 重要：不要在同一 tick 里继续沿“旧方向剩余位移”拖动，
+        # 否则会出现你反馈的“轨迹混乱/不像重新按下后的鼠标轨迹”。
+        need_recenter = not _inside_circle(proposed)
+        target1 = proposed
+        if need_recenter:
+            # 线段与圆的交点（cur 在圆内，proposed 在圆外）
+            ax = float(cur[0]) - float(anchor[0])
+            ay = float(cur[1]) - float(anchor[1])
+            dx1 = float(proposed[0]) - float(cur[0])
+            dy1 = float(proposed[1]) - float(cur[1])
+            a = dx1 * dx1 + dy1 * dy1
+            t_hit = None
+            if a > 1e-9:
+                b = 2.0 * (ax * dx1 + ay * dy1)
+                c = ax * ax + ay * ay - r * r
+                disc = b * b - 4.0 * a * c
+                if disc >= 0.0:
+                    sd = math.sqrt(disc)
+                    t1 = (-b - sd) / (2.0 * a)
+                    t2 = (-b + sd) / (2.0 * a)
+                    cand = [t for t in (t1, t2) if 0.0 <= t <= 1.0]
+                    if cand:
+                        t_hit = min(cand)
+            target1 = _clamp_to_circle(proposed) if t_hit is None else (float(cur[0] + dx1 * t_hit), float(cur[1] + dy1 * t_hit))
+
+        # 覆盖层可视化：视角拖动的目标点（蓝/橙由 pressed 决定）
         try:
-            now = time.monotonic()
             with self._lock:
                 self._click_markers["camera"] = ClickMarker(
-                    x=float(end[0]),
-                    y=float(end[1]),
+                    x=float(target1[0]),
+                    y=float(target1[1]),
                     label="视角拖动",
                     pressed_until_ts=now + 0.20,
                 )
@@ -886,18 +1310,104 @@ class Engine:
             pass
 
         try:
-            self._inj.left_down(a)
-            # 给极小的按下窗口，让“按住拖动”更稳定；同时避免过长 sleep 影响调度（摇杆会饿死）。
-            time.sleep(0.003)
-            self._inj.drag_smooth(a, end, max_step_px=self._profile.scheduler.maxStepPx, step_delay_s=0.0)
-            time.sleep(0.002)
-            self._inj.left_up(end)
-            self._last_camera_ts = time.monotonic()
-        except Exception:
+            # step_delay_s 稍微给一点节奏，让轨迹更“手指”
+            self._inj.drag_smooth(cur, target1, max_step_px=self._profile.scheduler.maxStepPx, step_delay_s=0.001)
+
+            if need_recenter:
+                # 到达边界：抬起并进入“回中待机”状态。
+                # 关键：不要在同一 tick 里立刻在锚点重新按下，否则 iPhone Mirroring/游戏端可能把
+                # “边界→锚点”的跳变误判为反方向拖动。
+                try:
+                    self._inj.left_up(target1)
+                except Exception:
+                    pass
+                # 关键：在“未按下”状态下先把光标移回锚点，
+                # 避免 iPhone Mirroring/游戏端把下一次 mouseDown 视作一次跨位置的拖动/反向跳动。
+                try:
+                    self._inj.move_cursor((float(anchor[0]), float(anchor[1])))
+                except Exception:
+                    pass
+                with self._lock:
+                    self._cam_session = CameraSession()  # 已抬起：结束本次按住
+                    self._mouse_dx_acc = 0.0
+                    self._mouse_dy_acc = 0.0
+                    self._cam_recenter_pending = True
+                    # 回中目标严格使用锚点坐标（不随机），避免肉眼“回中偏移”
+                    self._cam_recenter_pos = (float(anchor[0]), float(anchor[1]))
+                    self._cam_recenter_mouse_ts0 = float(self._last_mouse_event_ts)
+                self._last_camera_ts = now
+                self._log.info("视角到达边界：已抬起，等待新轨迹后回中")
+                return
+
+            with self._lock:
+                if self._cam_session.active:
+                    self._cam_session.touch_pos = target1
+                    self._cam_session.last_drag_ts = now
+            self._last_camera_ts = now
+        except Exception as e:
+            self._warn_throttled("camera_drag_failed", now, "视角拖动失败：%s", e)
             self._safe_release_all()
 
+    def _maybe_start_camera_after_recenter(self, now: float) -> bool:
+        """
+        视角回中待机状态机：
+        - 达到边界时先抬起，进入 pending
+        - pending 期间不采集鼠标轨迹
+        - 只有当检测到“新的真实鼠标移动事件”到来时，才在锚点重新按下，并清空累计位移
+        """
+        with self._lock:
+            pending = bool(self._cam_recenter_pending)
+            pos = self._cam_recenter_pos
+            ts0 = float(self._cam_recenter_mouse_ts0)
+            last_ts = float(self._last_mouse_event_ts)
+
+        if (not pending) or (pos is None):
+            return False
+
+        # 还没有新的鼠标移动（保持待机，让摇杆等其他控件继续工作）
+        if last_ts <= ts0:
+            return False
+
+        # 单指限制：重新按下前释放摇杆（避免立刻被其它服务抢占）
+        self._release_joystick_hold()
+
+        try:
+            # 光标位置先回锚点（未按下），再 mouseDown，避免“边界→锚点”被误判成拖动。
+            try:
+                self._inj.move_cursor(pos)
+            except Exception:
+                pass
+            self._inj.left_down(pos)
+            # 给极小的按下窗口，让“按住拖动”更稳定
+            time.sleep(0.003)
+        except Exception as e:
+            self._warn_throttled("camera_recenter_down_failed", now, "视角回中按下失败：%s", e)
+            self._safe_release_all()
+            with self._lock:
+                self._cam_recenter_pending = False
+                self._cam_recenter_pos = None
+            return True
+
+        with self._lock:
+            self._cam_recenter_pending = False
+            self._cam_recenter_pos = None
+            self._mouse_dx_acc = 0.0
+            self._mouse_dy_acc = 0.0
+            self._cam_session.active = True
+            self._cam_session.touch_pos = pos
+            self._cam_session.last_drag_ts = now
+        self._last_camera_ts = now
+        try:
+            self._log.info("视角回中：已重新按下 @ (%.1f, %.1f)", float(pos[0]), float(pos[1]))
+        except Exception:
+            self._log.info("视角回中：已重新按下")
+        return True
+
     def _service_joystick(self, keys_down: set[int]) -> None:
-        c = self._profile.points["joystickCenter"]
+        # 单指限制：摇杆占用触点时需要先释放“视角按住”
+        self._release_camera_hold()
+
+        c0 = self._profile.points["joystickCenter"]
         joy = self._profile.joystick
 
         vx = 0.0
@@ -916,15 +1426,57 @@ class Engine:
             # 没有方向输入：释放摇杆按住
             self._release_joystick_hold()
             return
-        target = add(c, scale(v, float(joy.radiusPx)))
+        now = time.monotonic()
 
-        # 覆盖层可视化：WASD（或自定义移动键）对应的摇杆目标点
+        # 摇杆需要“按住拖动并保持”才能稳定生效：
+        # - Down 必须发生在摇杆中心附近
+        # - 拖动到 8 方向目标点（由 WASD 组合决定），并保持按住
+        with self._lock:
+            active = bool(self._joy_session.active)
+            cur = self._joy_session.touch_pos
+            center = self._joy_session.center_pos
+
+        # 初始化一次“摇杆按住”（Down），并固定本次按住周期内的中心点（支持随机半径）
+        if (not active) or (cur is None) or (center is None):
+            rr = joy.rrandPx
+            if rr is None:
+                rr = self._cfg.global_.rrandDefaultPx
+            center = random_point(c0, float(rr or 0.0), rng=self._rng)
+            try:
+                self._inj.left_down(center)
+                # 与真实手指一致：Down 后立刻开始向目标方向拖动（不要等到下一 tick）
+                cur = center
+            except Exception as e:
+                self._warn_throttled("joystick_down_failed", now, "摇杆按下失败：%s", e)
+                self._safe_release_all()
+                return
+            with self._lock:
+                self._joy_session.active = True
+                self._joy_session.center_pos = center
+                self._joy_session.touch_pos = cur
+                self._joy_session.last_ts = now
+            self._last_joystick_ts = now
+            self._log.info("摇杆按下 @ (%.1f, %.1f)", float(center[0]), float(center[1]))
+
+        target = add(center, scale(v, float(joy.radiusPx)))
+
+        # 覆盖层可视化：显示目标点。按住期间保持橙色。
+        label = "摇杆"
         try:
             g = self._cfg.global_
-            label = f"摇杆({g.moveUpKey}/{g.moveDownKey}/{g.moveLeftKey}/{g.moveRightKey})"
+            parts: list[str] = []
+            if self._kc_move_up in keys_down:
+                parts.append(str(g.moveUpKey))
+            if self._kc_move_down in keys_down:
+                parts.append(str(g.moveDownKey))
+            if self._kc_move_left in keys_down:
+                parts.append(str(g.moveLeftKey))
+            if self._kc_move_right in keys_down:
+                parts.append(str(g.moveRightKey))
+            if parts:
+                label = "摇杆：" + "+".join(parts)
         except Exception:
-            label = "摇杆"
-        now = time.monotonic()
+            pass
         with self._lock:
             self._click_markers["joystick"] = ClickMarker(
                 x=float(target[0]),
@@ -933,44 +1485,69 @@ class Engine:
                 pressed_until_ts=now + 0.35,
             )
 
-        # 摇杆需要“按住拖动并保持”才能稳定生效；不能每次 down->drag->up（会被游戏判定无效）。
-        with self._lock:
-            active = bool(self._joy_session.active)
-            cur = self._joy_session.touch_pos
-
         try:
-            if not active or cur is None:
-                # 重新开始一次摇杆按住
-                self._inj.left_down(c)
-                time.sleep(0.004)
-                self._inj.drag_smooth(c, target, max_step_px=self._profile.scheduler.maxStepPx, step_delay_s=0.0)
-            else:
-                # 更新方向：从上一次触点位置拖到新目标（保持按住）
-                self._inj.drag_smooth(cur, target, max_step_px=self._profile.scheduler.maxStepPx, step_delay_s=0.0)
-
+            # 用分段拖动，确保从中心到目标有连续轨迹（更像手指）。
+            max_step = max(10.0, float(self._profile.scheduler.maxStepPx))
+            self._inj.drag_smooth(cur, target, max_step_px=max_step, step_delay_s=0.0)
             with self._lock:
-                self._joy_session.active = True
-                self._joy_session.touch_pos = target
+                if self._joy_session.active:
+                    self._joy_session.touch_pos = target
+                    self._joy_session.last_ts = now
             self._last_joystick_ts = now
-            # 设定最小保持窗口（使用 tauMs 作为“手感保持”参数）
-            hold_s = max(0.02, min(0.09, float(joy.tauMs) / 1000.0))
-            self._joy_hold_until_ts = time.monotonic() + hold_s
-        except Exception:
+            # 设定最小保持窗口（使用 tauMs 作为“手感保持”参数）。
+            hold_s = max(0.04, min(0.20, float(joy.tauMs) / 1000.0))
+            self._joy_hold_until_ts = now + hold_s
+        except Exception as e:
+            self._warn_throttled("joystick_failed", now, "摇杆注入失败：%s", e)
             self._safe_release_all()
 
     def _release_joystick_hold(self) -> None:
         with self._lock:
             active = bool(self._joy_session.active)
             pos = self._joy_session.touch_pos
+            center = self._joy_session.center_pos
             self._joy_session = JoystickSession()
             self._joy_hold_until_ts = 0.0
+        if not active:
+            return
+        try:
+            if center is not None:
+                self._log.info("摇杆释放 @ (%.1f, %.1f)", float(center[0]), float(center[1]))
+            else:
+                self._log.info("摇杆释放")
+        except Exception:
+            pass
+        try:
+            # 回中再抬起，避免游戏端把“离心抬起”误判为短拖动/无效（更符合真实摇杆手指行为）
+            if center is not None and pos is not None:
+                try:
+                    self._inj.left_drag(center)
+                except Exception:
+                    pass
+                self._inj.left_up(center)
+            else:
+                self._inj.left_up(pos or self._inj.get_cursor_pos())
+        except Exception:
+            pass
+        # 战斗态下保持光标隐藏，避免释放摇杆导致光标闪现
+        try:
+            if self.current_mode() == Mode.BATTLE:
+                self._inj.hide_cursor()
+        except Exception:
+            pass
+
+    def _release_camera_hold(self) -> None:
+        with self._lock:
+            active = bool(self._cam_session.active)
+            pos = self._cam_session.touch_pos
+            self._cam_session = CameraSession()
         if not active:
             return
         try:
             self._inj.left_up(pos or self._inj.get_cursor_pos())
         except Exception:
             pass
-        # 战斗态下保持光标隐藏，避免释放摇杆导致光标闪现
+        # 战斗态下保持光标隐藏，避免释放导致光标闪现
         try:
             if self.current_mode() == Mode.BATTLE:
                 self._inj.hide_cursor()
@@ -982,6 +1559,7 @@ class Engine:
         with self._lock:
             self._wheel = WheelSession()
             self._joy_session = JoystickSession()
+            self._cam_session = CameraSession()
             self._joy_hold_until_ts = 0.0
         try:
             self._inj.release_all()
