@@ -1223,21 +1223,13 @@ class Engine:
         if (abs(dx) + abs(dy)) < float(cam.tcamPx):
             return
 
-        # 单次最多消耗 thresholdPx 的鼠标位移（阈值越小越丝滑）
-        thr = max(1e-3, float(getattr(cam, "thresholdPx", 10.0)))
-        l = math.hypot(dx, dy)
-        if l > thr:
-            s = thr / l
-            use_dx = dx * s
-            use_dy = dy * s
-        else:
-            use_dx = dx
-            use_dy = dy
-
-        # 扣减已消耗的输入，剩余的下一帧继续处理
+        # 用户诉求：视角拖动与鼠标位移 1:1（不做“步长/阈值”分段消耗）。
+        # 这里直接一次性消费累计位移，避免阈值导致的“变慢/不一致”。
+        use_dx = dx
+        use_dy = dy
         with self._lock:
-            self._mouse_dx_acc -= use_dx
-            self._mouse_dy_acc -= use_dy
+            self._mouse_dx_acc = 0.0
+            self._mouse_dy_acc = 0.0
 
         sx = use_dx
         sy = use_dy * (-1.0 if cam.invertY else 1.0)
@@ -1323,8 +1315,9 @@ class Engine:
             pass
 
         try:
-            # step_delay_s 稍微给一点节奏，让轨迹更“手指”
-            self._inj.drag_smooth(cur, target1, max_step_px=self._profile.scheduler.maxStepPx, step_delay_s=0.001)
+            # 用户诉求：取消分段步长（maxStepPx）影响，单次 leftDragged 直接移动到目标点，
+            # 让注入轨迹尽量与鼠标实际位移一致。
+            self._inj.left_drag(target1)
 
             if need_recenter:
                 # 到达边界：抬起并进入“回中待机”状态。
@@ -1343,11 +1336,11 @@ class Engine:
                     # 回中目标严格使用锚点坐标（不随机），避免肉眼“回中偏移”
                     self._cam_recenter_pos = (float(anchor[0]), float(anchor[1]))
                     self._cam_recenter_mouse_ts0 = float(self._last_mouse_event_ts)
-                # 关键：使用 CGWarpMouseCursorPosition 把系统光标回到锚点（比 mouseMoved 更“硬”），
-                # 某些情况下 iPhone Mirroring 仅在光标真实位置改变后才会正确重置下一段拖动基线。
-                # 注意：warp 会触发未打标的 mouseMoved 事件，因此必须在 pending 状态下进行。
+                # 关键：用“注入的 mouseMoved(带 user_data_tag)”把光标移回锚点。
+                # 这样 iPhone Mirroring 能看到光标回中，而本程序的 EventTap 会忽略该事件（不把它当真实鼠标轨迹），
+                # 避免因吞掉 warp 产生的系统 mouseMoved 导致消费端仍以“旧末点”为基线，从而出现回中后反向拖动。
                 try:
-                    self._inj.warp((float(anchor[0]), float(anchor[1])))
+                    self._inj.move_cursor((float(anchor[0]), float(anchor[1])))
                 except Exception:
                     pass
                 with self._lock:
