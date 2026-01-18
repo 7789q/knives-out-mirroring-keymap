@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import random
 import threading
@@ -144,9 +145,6 @@ class Engine:
         self._wheel = WheelSession()
         self._joy_session = JoystickSession()
         self._cam_session = CameraSession()
-        # 视角相对拖动：Quartz/设备可能提供 float delta；这里累积小数部分，避免频繁 round 导致“抖/卡”。
-        self._cam_dx_rem: float = 0.0
-        self._cam_dy_rem: float = 0.0
 
         # 键盘状态兜底：部分场景（例如系统安全输入）可能导致 EventTap 收不到键盘事件。
         # 这里通过轮询 CGEventSourceKeyState 做“WASD/热键/自定义按键”的备用输入源。
@@ -1191,13 +1189,12 @@ class Engine:
                 pass
 
     def _service_camera(self, dx: float, dy: float) -> None:
-        # 视角相对拖动（方案 A）：
-        # - 触点始终落在锚点附近（Down 一次后保持按住）
-        # - 每次只把“真实鼠标 delta”原样注入到 drag 的 delta 字段
-        # 好处：不再需要半径限制/触边回中/残留位移，避免回中被记录导致的反向拖动；
-        # 且不会因为阈值/限幅而出现“走走停停”的卡顿。
+        # 视角拖动（绝对坐标）：iPhone Mirroring/游戏端通常按“光标位置变化”驱动拖动，
+        # 仅设置 delta 字段可能不会生效。因此这里以锚点为中心维护一个“触控点位置”，
+        # 每次将真实鼠标 delta 映射为触控点的位移，并限制在半径内；触边时自动抬起→回锚点→再按下。
         #
-        # 单指限制：执行视角拖动前需要释放摇杆触点。
+        # 关键：回锚点必须发生在抬起状态下，且回锚点事件的 delta 必须为 0（见 Injector.move_cursor），
+        # 否则会被 iPhone Mirroring 记录为“反向拖动”。
         self._release_joystick_hold()
 
         cam = self._profile.camera
@@ -1209,32 +1206,18 @@ class Engine:
             dy = float(self._mouse_dy_acc)
             self._mouse_dx_acc = 0.0
             self._mouse_dy_acc = 0.0
-            rem_x = float(self._cam_dx_rem)
-            rem_y = float(self._cam_dy_rem)
             cam_active = bool(self._cam_session.active)
-            pos = self._cam_session.touch_pos
+            cur = self._cam_session.touch_pos
 
         if dx == 0.0 and dy == 0.0:
             return
 
         # 注意：invertY 作用在“拖动坐标系”上
-        dy = float(dy) * (-1.0 if cam.invertY else 1.0)
-
-        # 保留小数部分，尽量做到“输出 delta 的积分”与真实鼠标一致
-        sx = rem_x + float(dx)
-        sy = rem_y + float(dy)
-        ix = int(sx)  # toward 0
-        iy = int(sy)
-        with self._lock:
-            self._cam_dx_rem = float(sx - ix)
-            self._cam_dy_rem = float(sy - iy)
-
-        # 没有产生可注入的整型 delta：保留 rem 等下一次
-        if ix == 0 and iy == 0:
-            return
+        sx = float(dx)
+        sy = float(dy) * (-1.0 if cam.invertY else 1.0)
 
         # 首次拖动：先在 anchor 处按下并进入“视角按住”session
-        if (not cam_active) or (pos is None):
+        if (not cam_active) or (cur is None):
             rr = cam.rrandPx
             if rr is None:
                 rr = self._cfg.global_.rrandDefaultPx
@@ -1249,29 +1232,114 @@ class Engine:
                 self._cam_session.active = True
                 self._cam_session.touch_pos = p0
                 self._cam_session.last_drag_ts = now
-            pos = p0
+            cur = p0
 
-        # 覆盖层可视化：视角拖动锚点（相对模式下，pos 固定）
+        r = max(1.0, float(cam.radiusPx))
+
+        def _inside_circle(p: Point) -> bool:
+            dx0 = float(p[0]) - float(anchor[0])
+            dy0 = float(p[1]) - float(anchor[1])
+            return (dx0 * dx0 + dy0 * dy0) <= (r * r + 1e-6)
+
+        def _clamp_to_circle(p: Point) -> Point:
+            dx0 = float(p[0]) - float(anchor[0])
+            dy0 = float(p[1]) - float(anchor[1])
+            dist0 = math.hypot(dx0, dy0)
+            if dist0 <= r or dist0 <= 1e-6:
+                return (float(p[0]), float(p[1]))
+            s0 = r / dist0
+            return (float(anchor[0] + dx0 * s0), float(anchor[1] + dy0 * s0))
+
+        cur = _clamp_to_circle(cur)
+
+        # 一次服务可能会触边多次（极高速甩动时）。用小循环把位移“分段消费”。
+        max_iters = 6
+        rem_sx = sx
+        rem_sy = sy
+        it = 0
+        while it < max_iters and (abs(rem_sx) + abs(rem_sy)) > 0.0:
+            it += 1
+            proposed = (float(cur[0] + rem_sx), float(cur[1] + rem_sy))
+            if _inside_circle(proposed):
+                target = proposed
+                try:
+                    self._inj.left_drag(target)
+                except Exception as e:
+                    self._warn_throttled("camera_drag_failed", now, "视角拖动失败：%s", e)
+                    self._safe_release_all()
+                    return
+                cur = (float(target[0]), float(target[1]))
+                rem_sx = 0.0
+                rem_sy = 0.0
+                break
+
+            # 线段与圆的交点（cur 在圆内，proposed 在圆外）
+            ax = float(cur[0]) - float(anchor[0])
+            ay = float(cur[1]) - float(anchor[1])
+            dx1 = float(proposed[0]) - float(cur[0])
+            dy1 = float(proposed[1]) - float(cur[1])
+            a = dx1 * dx1 + dy1 * dy1
+            t_hit: Optional[float] = None
+            if a > 1e-9:
+                b = 2.0 * (ax * dx1 + ay * dy1)
+                c = ax * ax + ay * ay - r * r
+                disc = b * b - 4.0 * a * c
+                if disc >= 0.0:
+                    sd = math.sqrt(disc)
+                    t1 = (-b - sd) / (2.0 * a)
+                    t2 = (-b + sd) / (2.0 * a)
+                    cand = [t for t in (t1, t2) if 0.0 <= t <= 1.0]
+                    if cand:
+                        t_hit = min(cand)
+
+            hit = _clamp_to_circle(proposed) if t_hit is None else (float(cur[0] + dx1 * t_hit), float(cur[1] + dy1 * t_hit))
+            try:
+                self._inj.left_drag(hit)
+            except Exception as e:
+                self._warn_throttled("camera_drag_failed", now, "视角拖动失败：%s", e)
+                self._safe_release_all()
+                return
+
+            # 剩余位移（继续沿原方向消费）
+            rem_sx = float(proposed[0] - hit[0])
+            rem_sy = float(proposed[1] - hit[1])
+
+            # 触边：抬起→回锚点→再按下（回锚点用 move_cursor 且 delta=0，避免反向拖动）
+            try:
+                self._inj.left_up(hit)
+            except Exception:
+                pass
+            try:
+                self._inj.move_cursor(anchor)
+            except Exception:
+                pass
+            rr = cam.rrandPx
+            if rr is None:
+                rr = self._cfg.global_.rrandDefaultPx
+            p0 = random_point(anchor, float(rr or 0.0), rng=self._rng)
+            try:
+                self._inj.left_down(p0)
+            except Exception as e:
+                self._warn_throttled("camera_down_failed", now, "视角按下失败：%s", e)
+                self._safe_release_all()
+                return
+            cur = p0
+
+        # 覆盖层可视化：显示当前触点（用于排查）
         try:
             with self._lock:
                 self._click_markers["camera"] = ClickMarker(
-                    x=float(pos[0]),
-                    y=float(pos[1]),
+                    x=float(cur[0]),
+                    y=float(cur[1]),
                     label="视角拖动",
                     pressed_until_ts=now + 0.20,
                 )
         except Exception:
             pass
 
-        try:
-            self._inj.left_drag_delta(pos, ix, iy)
-        except Exception as e:
-            self._warn_throttled("camera_drag_failed", now, "视角拖动失败：%s", e)
-            self._safe_release_all()
-            return
-
         with self._lock:
             if self._cam_session.active:
+                self._cam_session.touch_pos = (float(cur[0]), float(cur[1]))
                 self._cam_session.last_drag_ts = now
         self._last_camera_ts = now
 
@@ -1434,8 +1502,6 @@ class Engine:
             self._cam_session = CameraSession()
             self._mouse_dx_acc = 0.0
             self._mouse_dy_acc = 0.0
-            self._cam_dx_rem = 0.0
-            self._cam_dy_rem = 0.0
             self._joy_hold_until_ts = 0.0
         try:
             self._inj.release_all()
