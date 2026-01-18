@@ -67,8 +67,10 @@ class _MarkerView(NSView):
             pass
 
     def isFlipped(self):  # type: ignore[override]
-        # 与 Quartz 的屏幕坐标保持一致：原点左上，Y 向下
-        return True
+        # 使用 AppKit 默认坐标系（原点左下，Y 向上）。
+        # 由 _MarkerOverlay.update 负责把 Quartz 全局坐标（原点左上，Y 向下）
+        # 转换为本视图坐标，避免不同 pyobjc 版本下 flipped 行为差异导致偏移。
+        return False
 
     def drawRect_(self, rect) -> None:  # type: ignore[override]
         # 透明覆盖层，仅绘制点位标记
@@ -190,7 +192,7 @@ class _MarkerOverlay:
         if not self._windows:
             return
 
-        # 按屏幕分发坐标（Quartz 全局 -> 每屏局部）
+        # 按屏幕分发坐标（Quartz 全局 -> 每屏局部 -> AppKit 本地）
         per_view: list[list[dict]] = [[] for _ in self._views]
         for m in markers_global:
             try:
@@ -203,7 +205,8 @@ class _MarkerOverlay:
                 if gx >= bx and gx <= bx + bw and gy >= by and gy <= by + bh:
                     mm = dict(m)
                     mm["x"] = gx - bx
-                    mm["y"] = gy - by
+                    # 转换到 AppKit 视图坐标：origin=左下，Y 向上
+                    mm["y"] = bh - (gy - by)
                     per_view[idx].append(mm)
                     break
 
@@ -258,7 +261,7 @@ class AppDelegate(NSObject):
         self._point_fields = {}  # {"C": (xField, yField), ...}
 
         self._joy_radius = None
-        self._cam_sens = None
+        self._cam_thresh = None
         self._cam_invert = None
         self._cam_tcam = None
         self._cam_radius = None
@@ -404,14 +407,62 @@ class AppDelegate(NSObject):
             lbl.setStringValue_(text)
             return lbl
 
-        # 顶部：不暴露/不选择配置文件（设置以 UI 为准，自动持久化到用户目录）
-        content.addSubview_(_label("设置会自动保存（无需选择配置文件）", 20, 620, 420))
-        # Profile + 保存/重载
-        self._profile_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(20, 590, 220, 26), False)
-        self._profile_popup.setTarget_(self)
-        self._profile_popup.setAction_("onProfileChanged:")
-        content.addSubview_(self._profile_popup)
-        content.addSubview_(_label("配置档", 250, 590, 80))
+        # 按键下拉选项：不再使用“录入”，避免焦点/输入框占用导致误操作。
+        # 选项严格对应当前引擎支持的键名（keycodes.KEYCODES + MouseLeft/MouseRight）。
+        try:
+            from mirroring_keymap.macos.keycodes import KEYCODES
+        except Exception:
+            KEYCODES = {}  # type: ignore[assignment]
+
+        def _key_sort_key(name: str) -> tuple:
+            # F1..F12
+            if name.startswith("F") and name[1:].isdigit():
+                return (0, int(name[1:]))
+            # letters
+            if len(name) == 1 and name.isalpha():
+                return (1, name)
+            # digits
+            if len(name) == 1 and name.isdigit():
+                return (2, name)
+            # common specials (manual order)
+            special = {
+                "Tab": 0,
+                "Space": 1,
+                "Escape": 2,
+                "CapsLock": 3,
+                "Shift": 4,
+                "Control": 5,
+                "Option": 6,
+                "LeftArrow": 7,
+                "RightArrow": 8,
+                "UpArrow": 9,
+                "DownArrow": 10,
+            }
+            return (3, special.get(name, 999), name)
+
+        _keyboard_keys = sorted([str(k) for k in getattr(KEYCODES, "keys", lambda: [])()], key=_key_sort_key)
+        _keys_with_mouse = ["MouseLeft", "MouseRight"] + _keyboard_keys
+
+        def _key_popup(rect, *, include_mouse: bool) -> NSPopUpButton:
+            p = NSPopUpButton.alloc().initWithFrame_pullsDown_(rect, False)
+            titles = _keys_with_mouse if include_mouse else _keyboard_keys
+            try:
+                p.addItemsWithTitles_(titles)
+            except Exception:
+                # 某些 pyobjc 版本下 addItemsWithTitles_ 可能不稳定，退化为逐个 addItemWithTitle_
+                for t in titles:
+                    try:
+                        p.addItemWithTitle_(t)
+                    except Exception:
+                        pass
+            return p
+
+        # 顶部：不暴露/不选择配置文件/配置档（设置以 UI 为准，自动持久化到用户目录）
+        content.addSubview_(_label("设置会自动保存（无需选择配置文件/配置档）", 20, 620, 520))
+        try:
+            content.addSubview_(_label(f"保存位置：{self._cfg_path()}", 20, 592, 640))
+        except Exception:
+            content.addSubview_(_label("保存位置：~/Library/Application Support/MirroringKeymap/config.json", 20, 592, 640))
 
         btn_save = NSButton.alloc().initWithFrame_(NSMakeRect(680, 588, 100, 28))
         btn_save.setTitle_("保存设置")
@@ -505,7 +556,7 @@ class AppDelegate(NSObject):
         content.addSubview_(self._lbl_pick)
 
         # --------------------
-        # 分页设置：把“点位/参数/按键/自定义”按类别分开，避免挤在同一屏；
+        # 分页设置：把“点位/参数/自定义”按类别分开，避免挤在同一屏；
         # 同时每页使用 ScrollView，窗口缩小后仍可滚动查看全部设置。
         self._tab = NSTabView.alloc().initWithFrame_(NSMakeRect(20, 70, 870, 355))
         self._tab.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
@@ -536,9 +587,28 @@ class AppDelegate(NSObject):
         # Tab 1: 点位
         # --------------------
         doc_points = _add_tab("points", "点位", 860, 360)
-        doc_points.addSubview_(_label("关键点位（屏幕全局坐标）", 20, 325, 300))
+        doc_points.addSubview_(_label("点位 + 对应按键（屏幕全局坐标）", 20, 325, 300))
+
+        # 全局热键/通用参数（放在同一页，避免“按键页”和“点位页”来回切）
+        doc_points.addSubview_(_label("启用", 520, 327, 35))
+        self._global_enable_hotkey = _key_popup(NSMakeRect(555, 320, 70, 26), include_mouse=False)
+        doc_points.addSubview_(self._global_enable_hotkey)
+
+        doc_points.addSubview_(_label("紧急", 635, 327, 35))
+        self._global_panic_hotkey = _key_popup(NSMakeRect(670, 320, 70, 26), include_mouse=False)
+        doc_points.addSubview_(self._global_panic_hotkey)
+
+        doc_points.addSubview_(_label("随机", 750, 327, 35))
+        self._global_rrand_default = NSTextField.alloc().initWithFrame_(NSMakeRect(785, 322, 55, 24))
+        doc_points.addSubview_(self._global_rrand_default)
+
         doc_points.addSubview_(_label("X", 170, 295, 20))
         doc_points.addSubview_(_label("Y", 290, 295, 20))
+        doc_points.addSubview_(_label("键", 520, 295, 18))
+        doc_points.addSubview_(_label("上", 545, 295, 18))
+        doc_points.addSubview_(_label("下", 595, 295, 18))
+        doc_points.addSubview_(_label("左", 645, 295, 18))
+        doc_points.addSubview_(_label("右", 695, 295, 18))
 
         self._point_fields = {}
         point_defs = [
@@ -564,8 +634,37 @@ class AppDelegate(NSObject):
             doc_points.addSubview_(btn_fill)
             self._point_fields[key] = (fx, fy)
 
+            # 对应按键设置：跟随点位展示（用户诉求：按键设置与点位设置合并）
+            if key == "joystickCenter":
+                self._global_move_up_key = _key_popup(NSMakeRect(540, y - 1, 55, 26), include_mouse=False)
+                self._global_move_down_key = _key_popup(NSMakeRect(595, y - 1, 55, 26), include_mouse=False)
+                self._global_move_left_key = _key_popup(NSMakeRect(650, y - 1, 55, 26), include_mouse=False)
+                self._global_move_right_key = _key_popup(NSMakeRect(705, y - 1, 55, 26), include_mouse=False)
+                doc_points.addSubview_(self._global_move_up_key)
+                doc_points.addSubview_(self._global_move_down_key)
+                doc_points.addSubview_(self._global_move_left_key)
+                doc_points.addSubview_(self._global_move_right_key)
+            elif key == "cameraAnchor":
+                self._global_camera_lock_key = _key_popup(NSMakeRect(540, y - 1, 160, 26), include_mouse=False)
+                doc_points.addSubview_(self._global_camera_lock_key)
+            elif key == "fire":
+                self._global_fire_key = _key_popup(NSMakeRect(540, y - 1, 160, 26), include_mouse=True)
+                doc_points.addSubview_(self._global_fire_key)
+            elif key == "scope":
+                self._global_scope_key = _key_popup(NSMakeRect(540, y - 1, 160, 26), include_mouse=True)
+                doc_points.addSubview_(self._global_scope_key)
+            elif key == "backpack":
+                self._global_backpack_key = _key_popup(NSMakeRect(540, y - 1, 160, 26), include_mouse=False)
+                doc_points.addSubview_(self._global_backpack_key)
+
         doc_points.addSubview_(
-            _label("提示：先点“取点”，再点每行的“填入取点”。坐标是屏幕全局坐标（非窗口相对）。", 20, 20, 820)
+            _label(
+                "提示：先点“取点”，再点每行的“填入取点”。坐标是屏幕全局坐标（原点左上，Y 向下；非窗口相对）。"
+                " 键：支持 MouseLeft/MouseRight 或键盘按键名（如 E/Space/Tab）。",
+                20,
+                20,
+                820,
+            )
         )
 
         # --------------------
@@ -578,9 +677,9 @@ class AppDelegate(NSObject):
         self._joy_radius = NSTextField.alloc().initWithFrame_(NSMakeRect(115, 360, 90, 24))
         doc_params.addSubview_(self._joy_radius)
 
-        doc_params.addSubview_(_label("视角灵敏度", 235, 365, 80))
-        self._cam_sens = NSTextField.alloc().initWithFrame_(NSMakeRect(315, 360, 70, 24))
-        doc_params.addSubview_(self._cam_sens)
+        doc_params.addSubview_(_label("视角阈值(px)", 235, 365, 80))
+        self._cam_thresh = NSTextField.alloc().initWithFrame_(NSMakeRect(315, 360, 70, 24))
+        doc_params.addSubview_(self._cam_thresh)
 
         self._cam_invert = NSButton.alloc().initWithFrame_(NSMakeRect(405, 360, 120, 24))
         self._cam_invert.setButtonType_(NSButtonTypeSwitch)
@@ -639,53 +738,7 @@ class AppDelegate(NSObject):
         doc_params.addSubview_(self._sched_max_step)
 
         # --------------------
-        # Tab 3: 按键
-        # --------------------
-        doc_keys = _add_tab("keys", "按键", 860, 360)
-        doc_keys.addSubview_(_label("按键设置（全局）", 20, 325, 200))
-
-        doc_keys.addSubview_(_label("启用热键", 20, 285, 60))
-        self._global_enable_hotkey = NSTextField.alloc().initWithFrame_(NSMakeRect(80, 280, 70, 24))
-        doc_keys.addSubview_(self._global_enable_hotkey)
-
-        doc_keys.addSubview_(_label("紧急热键", 170, 285, 60))
-        self._global_panic_hotkey = NSTextField.alloc().initWithFrame_(NSMakeRect(230, 280, 70, 24))
-        doc_keys.addSubview_(self._global_panic_hotkey)
-
-        doc_keys.addSubview_(_label("开火键", 320, 285, 45))
-        self._global_fire_key = NSTextField.alloc().initWithFrame_(NSMakeRect(365, 280, 90, 24))
-        doc_keys.addSubview_(self._global_fire_key)
-
-        doc_keys.addSubview_(_label("开镜键", 470, 285, 45))
-        self._global_scope_key = NSTextField.alloc().initWithFrame_(NSMakeRect(515, 280, 90, 24))
-        doc_keys.addSubview_(self._global_scope_key)
-
-        doc_keys.addSubview_(_label("视角锁定键", 20, 245, 80))
-        self._global_camera_lock_key = NSTextField.alloc().initWithFrame_(NSMakeRect(100, 240, 90, 24))
-        doc_keys.addSubview_(self._global_camera_lock_key)
-
-        doc_keys.addSubview_(_label("背包键", 210, 245, 45))
-        self._global_backpack_key = NSTextField.alloc().initWithFrame_(NSMakeRect(255, 240, 90, 24))
-        doc_keys.addSubview_(self._global_backpack_key)
-
-        doc_keys.addSubview_(_label("移动(上/下/左/右)", 20, 205, 110))
-        self._global_move_up_key = NSTextField.alloc().initWithFrame_(NSMakeRect(135, 200, 40, 24))
-        self._global_move_down_key = NSTextField.alloc().initWithFrame_(NSMakeRect(185, 200, 40, 24))
-        self._global_move_left_key = NSTextField.alloc().initWithFrame_(NSMakeRect(235, 200, 40, 24))
-        self._global_move_right_key = NSTextField.alloc().initWithFrame_(NSMakeRect(285, 200, 40, 24))
-        doc_keys.addSubview_(self._global_move_up_key)
-        doc_keys.addSubview_(self._global_move_down_key)
-        doc_keys.addSubview_(self._global_move_left_key)
-        doc_keys.addSubview_(self._global_move_right_key)
-
-        doc_keys.addSubview_(_label("随机半径默认(px)", 20, 165, 100))
-        self._global_rrand_default = NSTextField.alloc().initWithFrame_(NSMakeRect(120, 160, 70, 24))
-        doc_keys.addSubview_(self._global_rrand_default)
-
-        doc_keys.addSubview_(_label("提示：MouseLeft/MouseRight 表示鼠标左右键。", 20, 20, 820))
-
-        # --------------------
-        # Tab 4: 自定义
+        # Tab 3: 自定义
         # --------------------
         doc_custom = _add_tab("custom", "自定义", 860, 420)
         doc_custom.addSubview_(_label("自定义点击（按键→点击）", 20, 385, 240))
@@ -695,10 +748,14 @@ class AppDelegate(NSObject):
         doc_custom.addSubview_(self._custom_name)
 
         doc_custom.addSubview_(_label("键", 295, 345, 20))
-        self._custom_key = NSTextField.alloc().initWithFrame_(NSMakeRect(315, 340, 90, 24))
+        self._custom_key = _key_popup(NSMakeRect(315, 339, 160, 26), include_mouse=False)
         doc_custom.addSubview_(self._custom_key)
+        try:
+            self._custom_key.selectItemWithTitle_("E")
+        except Exception:
+            pass
 
-        btn_add = NSButton.alloc().initWithFrame_(NSMakeRect(420, 339, 120, 26))
+        btn_add = NSButton.alloc().initWithFrame_(NSMakeRect(480, 339, 120, 26))
         btn_add.setTitle_("添加/替换")
         btn_add.setBezelStyle_(NSBezelStyleRounded)
         btn_add.setTarget_(self)
@@ -712,12 +769,19 @@ class AppDelegate(NSObject):
         self._custom_y = NSTextField.alloc().initWithFrame_(NSMakeRect(140, 300, 80, 24))
         doc_custom.addSubview_(self._custom_y)
 
-        doc_custom.addSubview_(_label("按压(ms)", 235, 305, 55))
-        self._custom_hold = NSTextField.alloc().initWithFrame_(NSMakeRect(290, 300, 70, 24))
+        btn_fill_custom = NSButton.alloc().initWithFrame_(NSMakeRect(235, 299, 100, 26))
+        btn_fill_custom.setTitle_("填入取点")
+        btn_fill_custom.setBezelStyle_(NSBezelStyleRounded)
+        btn_fill_custom.setTarget_(self)
+        btn_fill_custom.setAction_("onFillCustomPoint:")
+        doc_custom.addSubview_(btn_fill_custom)
+
+        doc_custom.addSubview_(_label("按压(ms)", 350, 305, 55))
+        self._custom_hold = NSTextField.alloc().initWithFrame_(NSMakeRect(405, 300, 70, 24))
         doc_custom.addSubview_(self._custom_hold)
 
-        doc_custom.addSubview_(_label("随机(px)", 375, 305, 50))
-        self._custom_rrand = NSTextField.alloc().initWithFrame_(NSMakeRect(425, 300, 70, 24))
+        doc_custom.addSubview_(_label("随机(px)", 485, 305, 50))
+        self._custom_rrand = NSTextField.alloc().initWithFrame_(NSMakeRect(535, 300, 70, 24))
         doc_custom.addSubview_(self._custom_rrand)
 
         doc_custom.addSubview_(_label("删除编号(1-based)", 20, 265, 95))
@@ -770,8 +834,8 @@ class AppDelegate(NSObject):
 
     @objc.python_method
     def _selected_profile(self) -> Optional[str]:
-        name = str(self._profile_popup.titleOfSelectedItem() or "").strip()
-        return name or None
+        # UI 不提供“配置档/Profiles”选择：始终使用第一个 profile
+        return None
 
     @objc.python_method
     def _ensure_log_window(self) -> None:
@@ -970,6 +1034,52 @@ class AppDelegate(NSObject):
         return k
 
     @objc.python_method
+    def _set_key_control(self, ctrl, value: str, default: str) -> None:
+        """
+        兼容两种 UI 控件：
+        - NSPopUpButton：用 selectItemWithTitle_
+        - NSTextField：用 setStringValue_
+        """
+        if ctrl is None:
+            return
+        v = str(value or "").strip() or str(default)
+        # 优先走下拉框
+        try:
+            ctrl.selectItemWithTitle_(v)
+            try:
+                if str(ctrl.titleOfSelectedItem() or "") != v:
+                    # 配置里可能有旧值：追加到末尾并选中
+                    ctrl.addItemWithTitle_(v)
+                    ctrl.selectItemWithTitle_(v)
+            except Exception:
+                pass
+            return
+        except Exception:
+            pass
+        # 回退：文本框
+        try:
+            ctrl.setStringValue_(v)
+        except Exception:
+            pass
+
+    @objc.python_method
+    def _get_key_control(self, ctrl, default: str) -> str:
+        if ctrl is None:
+            return str(default)
+        # 下拉框
+        try:
+            v = str(ctrl.titleOfSelectedItem() or "").strip()
+            return v or str(default)
+        except Exception:
+            pass
+        # 文本框
+        try:
+            v = str(ctrl.stringValue() or "").strip()
+            return v or str(default)
+        except Exception:
+            return str(default)
+
+    @objc.python_method
     def _profiles_list(self) -> list[dict]:
         if not isinstance(self._cfg_dict, dict):
             return []
@@ -1014,25 +1124,25 @@ class AppDelegate(NSObject):
             g = {}
 
         if self._global_enable_hotkey is not None:
-            self._global_enable_hotkey.setStringValue_(str(g.get("enableHotkey") or "F8"))
+            self._set_key_control(self._global_enable_hotkey, str(g.get("enableHotkey") or ""), "F8")
         if self._global_panic_hotkey is not None:
-            self._global_panic_hotkey.setStringValue_(str(g.get("panicHotkey") or "F12"))
+            self._set_key_control(self._global_panic_hotkey, str(g.get("panicHotkey") or ""), "F12")
         if self._global_camera_lock_key is not None:
-            self._global_camera_lock_key.setStringValue_(str(g.get("cameraLockKey") or "CapsLock"))
+            self._set_key_control(self._global_camera_lock_key, str(g.get("cameraLockKey") or ""), "Tab")
         if self._global_backpack_key is not None:
-            self._global_backpack_key.setStringValue_(str(g.get("backpackKey") or "Tab"))
+            self._set_key_control(self._global_backpack_key, str(g.get("backpackKey") or ""), "B")
         if self._global_move_up_key is not None:
-            self._global_move_up_key.setStringValue_(str(g.get("moveUpKey") or "W"))
+            self._set_key_control(self._global_move_up_key, str(g.get("moveUpKey") or ""), "W")
         if self._global_move_down_key is not None:
-            self._global_move_down_key.setStringValue_(str(g.get("moveDownKey") or "S"))
+            self._set_key_control(self._global_move_down_key, str(g.get("moveDownKey") or ""), "S")
         if self._global_move_left_key is not None:
-            self._global_move_left_key.setStringValue_(str(g.get("moveLeftKey") or "A"))
+            self._set_key_control(self._global_move_left_key, str(g.get("moveLeftKey") or ""), "A")
         if self._global_move_right_key is not None:
-            self._global_move_right_key.setStringValue_(str(g.get("moveRightKey") or "D"))
+            self._set_key_control(self._global_move_right_key, str(g.get("moveRightKey") or ""), "D")
         if self._global_fire_key is not None:
-            self._global_fire_key.setStringValue_(str(g.get("fireKey") or "MouseLeft"))
+            self._set_key_control(self._global_fire_key, str(g.get("fireKey") or ""), "MouseLeft")
         if self._global_scope_key is not None:
-            self._global_scope_key.setStringValue_(str(g.get("scopeKey") or "MouseRight"))
+            self._set_key_control(self._global_scope_key, str(g.get("scopeKey") or ""), "MouseRight")
         if self._global_rrand_default is not None:
             self._global_rrand_default.setStringValue_(str(g.get("rrandDefaultPx") if g.get("rrandDefaultPx") is not None else 0))
 
@@ -1071,8 +1181,15 @@ class AppDelegate(NSObject):
 
         if self._joy_radius is not None:
             self._joy_radius.setStringValue_(str(joystick.get("radiusPx") if joystick.get("radiusPx") is not None else 120))
-        if self._cam_sens is not None:
-            self._cam_sens.setStringValue_(str(camera.get("sensitivity") if camera.get("sensitivity") is not None else 1.0))
+        if self._cam_thresh is not None:
+            # 新字段：thresholdPx；兼容旧字段 sensitivity（映射到阈值倍率）
+            thr = camera.get("thresholdPx")
+            if thr is None and camera.get("sensitivity") is not None:
+                try:
+                    thr = float(camera.get("sensitivity")) * 6.0
+                except Exception:
+                    thr = None
+            self._cam_thresh.setStringValue_(str(thr if thr is not None else 6.0))
         if self._cam_invert is not None:
             self._cam_invert.setState_(1 if bool(camera.get("invertY")) else 0)
         if self._cam_tcam is not None:
@@ -1130,25 +1247,25 @@ class AppDelegate(NSObject):
             self._cfg_dict["global"] = g
 
         if self._global_enable_hotkey is not None:
-            g["enableHotkey"] = str(self._global_enable_hotkey.stringValue()).strip() or "F8"
+            g["enableHotkey"] = self._get_key_control(self._global_enable_hotkey, "F8")
         if self._global_panic_hotkey is not None:
-            g["panicHotkey"] = str(self._global_panic_hotkey.stringValue()).strip() or "F12"
+            g["panicHotkey"] = self._get_key_control(self._global_panic_hotkey, "F12")
         if self._global_camera_lock_key is not None:
-            g["cameraLockKey"] = str(self._global_camera_lock_key.stringValue()).strip() or "CapsLock"
+            g["cameraLockKey"] = self._get_key_control(self._global_camera_lock_key, "Tab")
         if self._global_backpack_key is not None:
-            g["backpackKey"] = str(self._global_backpack_key.stringValue()).strip() or "Tab"
+            g["backpackKey"] = self._get_key_control(self._global_backpack_key, "B")
         if self._global_move_up_key is not None:
-            g["moveUpKey"] = str(self._global_move_up_key.stringValue()).strip() or "W"
+            g["moveUpKey"] = self._get_key_control(self._global_move_up_key, "W")
         if self._global_move_down_key is not None:
-            g["moveDownKey"] = str(self._global_move_down_key.stringValue()).strip() or "S"
+            g["moveDownKey"] = self._get_key_control(self._global_move_down_key, "S")
         if self._global_move_left_key is not None:
-            g["moveLeftKey"] = str(self._global_move_left_key.stringValue()).strip() or "A"
+            g["moveLeftKey"] = self._get_key_control(self._global_move_left_key, "A")
         if self._global_move_right_key is not None:
-            g["moveRightKey"] = str(self._global_move_right_key.stringValue()).strip() or "D"
+            g["moveRightKey"] = self._get_key_control(self._global_move_right_key, "D")
         if self._global_fire_key is not None:
-            g["fireKey"] = str(self._global_fire_key.stringValue()).strip() or "MouseLeft"
+            g["fireKey"] = self._get_key_control(self._global_fire_key, "MouseLeft")
         if self._global_scope_key is not None:
-            g["scopeKey"] = str(self._global_scope_key.stringValue()).strip() or "MouseRight"
+            g["scopeKey"] = self._get_key_control(self._global_scope_key, "MouseRight")
         if self._global_rrand_default is not None:
             g["rrandDefaultPx"] = self._safe_float(self._global_rrand_default, 0.0)
 
@@ -1188,8 +1305,10 @@ class AppDelegate(NSObject):
 
         if self._joy_radius is not None:
             joystick["radiusPx"] = self._safe_float(self._joy_radius, 120.0)
-        if self._cam_sens is not None:
-            camera["sensitivity"] = self._safe_float(self._cam_sens, 1.0)
+        if self._cam_thresh is not None:
+            camera["thresholdPx"] = self._safe_float(self._cam_thresh, 6.0)
+            # 清理旧字段，避免混淆
+            camera.pop("sensitivity", None)
         if self._cam_invert is not None:
             camera["invertY"] = bool(self._cam_invert.state())
         if self._cam_tcam is not None:
@@ -1234,7 +1353,6 @@ class AppDelegate(NSObject):
             ui["mappingEnabled"] = bool(self._chk_enabled.state()) if self._chk_enabled is not None else False
             ui["cameraLock"] = bool(self._chk_camera.state()) if self._chk_camera is not None else False
             ui["overlayEnabled"] = bool(self._chk_overlay.state()) if self._chk_overlay is not None else False
-            ui["lastProfile"] = self._selected_profile()
         except Exception:
             pass
 
@@ -1344,6 +1462,13 @@ class AppDelegate(NSObject):
             self._alert("检测失败", str(e))
 
     def onStart_(self, _sender) -> None:
+        # 避免焦点停留在某个输入框导致按键被“打字进去”
+        try:
+            if self._window is not None:
+                self._window.makeFirstResponder_(None)
+        except Exception:
+            pass
+
         # 启动前自动保存一次，确保“直接点开始”也能使用当前表单值
         if not self._save_current_config():
             return
@@ -1480,38 +1605,18 @@ class AppDelegate(NSObject):
         except Exception:
             self._cfg_mtime = None
 
-        # 刷新 profile 列表
-        profiles = self._profiles_list()
-        names: list[str] = []
-        for i, p in enumerate(profiles):
-            if not isinstance(p, dict):
-                continue
-            nm = str(p.get("name") or f"配置档 {i+1}")
-            names.append(nm)
-            p["name"] = nm
-
-        if not names:
-            names = ["Default"]
-            if isinstance(self._cfg_dict, dict):
-                self._cfg_dict["profiles"] = [{"name": "Default", "points": {}}]
-
-        current = self._selected_profile()
-        desired = None
+        # UI 固定使用 profiles[0]，这里确保 profiles 至少有 1 个
         try:
-            ui = self._cfg_dict.get("ui") if isinstance(self._cfg_dict, dict) else None
-            if isinstance(ui, dict):
-                desired = str(ui.get("lastProfile") or "").strip() or None
+            if isinstance(self._cfg_dict, dict):
+                profiles = self._cfg_dict.get("profiles")
+                if not isinstance(profiles, list) or not profiles:
+                    self._cfg_dict["profiles"] = [{"name": "默认", "points": {}}]
+                else:
+                    p0 = profiles[0]
+                    if isinstance(p0, dict):
+                        p0["name"] = str(p0.get("name") or "默认")
         except Exception:
-            desired = None
-        self._profile_popup.removeAllItems()
-        for n in names:
-            self._profile_popup.addItemWithTitle_(n)
-        if current and current in names:
-            self._profile_popup.selectItemWithTitle_(current)
-        elif desired and desired in names:
-            self._profile_popup.selectItemWithTitle_(desired)
-        else:
-            self._profile_popup.selectItemAtIndex_(0)
+            pass
 
         # 同步表单
         self._sync_ui_from_cfg()
@@ -1536,6 +1641,17 @@ class AppDelegate(NSObject):
         path = self._cfg_path()
         try:
             self._apply_ui_to_cfg()
+            # 关键校验：锁定键与背包键不能相同，否则会出现“按一次同时触发两种行为”的混乱。
+            try:
+                g = self._cfg_dict.get("global") if isinstance(self._cfg_dict, dict) else None
+                if isinstance(g, dict):
+                    cam_k = str(g.get("cameraLockKey") or "").strip()
+                    bag_k = str(g.get("backpackKey") or "").strip()
+                    if cam_k and bag_k and cam_k == bag_k:
+                        self._alert("保存失败", "“视角锁定键”和“背包键”不能设置为同一个键，请修改其中一个。")
+                        return False
+            except Exception:
+                pass
             self._app.save_config_dict(path, self._cfg_dict)
         except Exception as e:
             self._alert("保存失败", str(e))
@@ -1556,6 +1672,12 @@ class AppDelegate(NSObject):
         return True
 
     def onSaveConfig_(self, _sender) -> None:
+        try:
+            if self._window is not None:
+                self._window.makeFirstResponder_(None)
+        except Exception:
+            pass
+
         snap = self._app.snapshot()
         was_running = bool(snap.get("running"))
         prev_mapping = bool(snap.get("mapping_enabled"))
@@ -1592,6 +1714,16 @@ class AppDelegate(NSObject):
         fx.setStringValue_(f"{x:.1f}")
         fy.setStringValue_(f"{y:.1f}")
 
+    def onFillCustomPoint_(self, _sender) -> None:
+        if self._last_pick is None:
+            self._alert("无法填入", "请先点击“取点（点击）”获取坐标。")
+            return
+        if self._custom_x is None or self._custom_y is None:
+            return
+        x, y = self._last_pick
+        self._custom_x.setStringValue_(f"{x:.1f}")
+        self._custom_y.setStringValue_(f"{y:.1f}")
+
     def onAddCustom_(self, _sender) -> None:
         if not isinstance(self._cfg_dict, dict):
             self.onReloadConfig_(None)
@@ -1599,9 +1731,9 @@ class AppDelegate(NSObject):
             return
 
         name = str(self._custom_name.stringValue() if self._custom_name else "").strip() or "Custom"
-        key = self._normalize_key(str(self._custom_key.stringValue() if self._custom_key else ""))
+        key = self._normalize_key(self._get_key_control(self._custom_key, "E"))
         if not key:
-            self._alert("新增失败", "请填写触发键（例如：E / R / Space / 1）。")
+            self._alert("新增失败", "请选择触发键（例如：E / R / Space / 1）。")
             return
 
         x_s = str(self._custom_x.stringValue() if self._custom_x else "").strip()
@@ -1698,8 +1830,7 @@ class AppDelegate(NSObject):
         if not snap.get("running"):
             self._lbl_status.setStringValue_(
                 "状态：未启动\n"
-                "提示：首次运行请在系统设置 → 隐私与安全性中开启“输入监控”和“辅助功能”权限；"
-                "点位坐标使用屏幕全局坐标；MouseLeft/MouseRight 表示鼠标左右键。"
+                "提示：首次运行请在系统设置 → 隐私与安全性中开启“输入监控”和“辅助功能”权限。"
             )
             self._btn_start.setEnabled_(True)
             self._btn_stop.setEnabled_(False)
@@ -1714,19 +1845,45 @@ class AppDelegate(NSObject):
         mode_map = {"paused": "暂停", "battle": "战斗", "free": "自由鼠标"}
         mode_cn = mode_map.get(str(snap.get("mode") or ""), str(snap.get("mode") or ""))
 
+        # 诊断：WASD 是否被捕获（EventTap/轮询）
+        def bit4(d: object) -> str:
+            if not isinstance(d, dict):
+                return "----"
+            try:
+                u = "1" if int(d.get("up") or 0) else "0"
+                l = "1" if int(d.get("left") or 0) else "0"
+                dn = "1" if int(d.get("down") or 0) else "0"
+                r = "1" if int(d.get("right") or 0) else "0"
+                return f"{u}{l}{dn}{r}"
+            except Exception:
+                return "----"
+
+        et_bits = bit4(snap.get("move_eventtap"))
+        pol_bits = bit4(snap.get("move_polled"))
+        poll_ok = yn(snap.get("poll_move_ok"))
+        secure = snap.get("secure_input")
+        secure_txt = "未知" if secure is None else yn(bool(secure))
+        age = snap.get("last_kbd_event_age_ms")
+        age_txt = "-" if age is None else f"{int(age)}ms"
+
         hint = ""
         if snap.get("accessibility_trusted") is False:
             hint = "提示：未授予“辅助功能”权限，可能无法注入点击/拖动。请到 系统设置 → 隐私与安全性 → 辅助功能 授权。"
+        elif secure is True:
+            hint = (
+                "提示：检测到系统已开启“安全输入”，第三方程序无法读取键盘事件，WASD 将无法工作。"
+                "请关闭可能开启安全输入的程序/输入框后重试。"
+            )
+        elif not bool(snap.get("target_active")):
+            hint = "提示：为避免误触，当前前台为本程序时会自动暂停映射。请切换到 iPhone Mirroring/游戏窗口后再测试按键。"
         elif not bool(snap.get("mapping_enabled")):
             hint = "提示：映射未启用，请勾选“启用映射”或按启用热键（默认 F8）。"
         elif str(snap.get("mode")) != "battle":
-            hint = "提示：当前为自由鼠标模式（不会触发开火/开镜/自定义点击），请开启“视角锁定”（默认 CapsLock）。"
+            hint = "提示：当前为自由鼠标模式（WASD 摇杆/开火/开镜/自定义点击都不会生效），请开启“视角锁定”（默认 Tab）。"
 
         txt = (
-            "状态：运行中\n"
-            f"配置档：{snap.get('profile')}\n"
-            f"模式：{mode_cn}\n"
-            f"启用映射：{yn(snap.get('mapping_enabled'))} | 视角锁定：{yn(snap.get('camera_lock'))} | 背包打开：{yn(snap.get('backpack_open'))}\n"
+            f"状态：运行中 | 模式：{mode_cn} | 映射：{yn(snap.get('mapping_enabled'))} | 视角锁定：{yn(snap.get('camera_lock'))} | 背包：{yn(snap.get('backpack_open'))}\n"
+            f"WASD检测(上左下右)：ET={et_bits} | 轮询={pol_bits} | 轮询可用：{poll_ok} | 安全输入：{secure_txt} | 最近键盘事件：{age_txt}\n"
             f"{hint}"
         )
         self._lbl_status.setStringValue_(txt)

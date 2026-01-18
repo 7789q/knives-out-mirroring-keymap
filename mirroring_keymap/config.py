@@ -34,8 +34,10 @@ class TargetWindowConfig:
 class GlobalConfig:
     enableHotkey: str = "F8"
     panicHotkey: str = "F12"
-    cameraLockKey: str = "CapsLock"
-    backpackKey: str = "Tab"
+    # 视角锁定切换键（用户更常用 Tab；CapsLock 作为可选）
+    cameraLockKey: str = "Tab"
+    # 背包/菜单切换键（建议不要与 cameraLockKey 冲突）
+    backpackKey: str = "B"
     # 移动摇杆方向键（默认 WASD）
     moveUpKey: str = "W"
     moveDownKey: str = "S"
@@ -59,7 +61,10 @@ class CameraConfig:
     tcamPx: float = 3.0
     radiusPx: float = 80.0
     invertY: bool = False
-    sensitivity: float = 1.0
+    # 视角拖动“阈值/平滑度”：
+    # - 引擎会把鼠标累计位移按该阈值分段消耗（每次最多消耗 thresholdPx）
+    # - 阈值越小越丝滑（但转动更慢）；阈值越大越灵敏（但更容易突兀）
+    thresholdPx: float = 6.0
     rrandPx: Optional[float] = None
 
 
@@ -152,8 +157,8 @@ def load_config(path: str | Path) -> AppConfig:
     global_cfg = GlobalConfig(
         enableHotkey=str(g.get("enableHotkey") or "F8"),
         panicHotkey=str(g.get("panicHotkey") or "F12"),
-        cameraLockKey=str(g.get("cameraLockKey") or "CapsLock"),
-        backpackKey=str(g.get("backpackKey") or "Tab"),
+        cameraLockKey=str(g.get("cameraLockKey") or "Tab"),
+        backpackKey=str(g.get("backpackKey") or "B"),
         moveUpKey=str(g.get("moveUpKey") or "W"),
         moveDownKey=str(g.get("moveDownKey") or "S"),
         moveLeftKey=str(g.get("moveLeftKey") or "A"),
@@ -217,7 +222,13 @@ def load_config(path: str | Path) -> AppConfig:
             tcamPx=float(camera_raw.get("tcamPx") or 3.0),
             radiusPx=float(camera_raw.get("radiusPx") or 80.0),
             invertY=bool(camera_raw.get("invertY") or False),
-            sensitivity=float(camera_raw.get("sensitivity") or 1.0),
+            thresholdPx=float(
+                # 新字段：thresholdPx
+                camera_raw.get("thresholdPx")
+                # 兼容旧字段：sensitivity（将其映射为阈值倍率）
+                if camera_raw.get("thresholdPx") is not None
+                else (float(camera_raw.get("sensitivity") or 1.0) * 6.0)
+            ),
             rrandPx=(float(camera_raw["rrandPx"]) if camera_raw.get("rrandPx") is not None else None),
         )
         fire = ActionConfig(
