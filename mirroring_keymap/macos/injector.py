@@ -35,7 +35,7 @@ class Injector:
         except Exception:
             pass
 
-    def _post_mouse(self, event_type: int, pos: Point, button: int) -> None:
+    def _post_mouse(self, event_type: int, pos: Point, button: int, *, delta: Optional[tuple[int, int]] = None) -> None:
         Q = self._Quartz
         ev = Q.CGEventCreateMouseEvent(None, event_type, pos, button)
         self._mark_event(ev)
@@ -54,7 +54,10 @@ class Injector:
                 dx = 0
                 dy = 0
             else:
-                if self._last_post_pos is None:
+                if delta is not None:
+                    dx = int(delta[0])
+                    dy = int(delta[1])
+                elif self._last_post_pos is None:
                     dx = 0
                     dy = 0
                 else:
@@ -103,7 +106,11 @@ class Injector:
             self.hide_cursor()
         else:
             self.show_cursor()
-        self.warp(snap.pos)
+        # 避免使用 CGWarpMouseCursorPosition：
+        # - 该 API 可能触发系统生成的 mouseMoved 事件（无法打标），
+        #   导致引擎把“回中/恢复光标”误当成真实鼠标输入，从而出现视角反向/抖动等问题。
+        # - 用可打标的 mouseMoved 事件来移动光标，能被 InputCapture 可靠过滤回流。
+        self.move_cursor(snap.pos)
 
     def left_down(self, pos: Point) -> None:
         # 不要在注入前 warp 光标：
@@ -123,13 +130,23 @@ class Injector:
         # 同 left_down：避免 warp 产生未打标事件。
         self._post_mouse(self._Quartz.kCGEventLeftMouseDragged, pos, self._Quartz.kCGMouseButtonLeft)
 
+    def left_drag_delta(self, pos: Point, dx: int, dy: int) -> None:
+        """
+        在固定位置注入 drag，但显式指定 delta（用于“相对拖动/锁定视角”模式）。
+        这样可避免用绝对坐标重建轨迹（半径/回中）导致的卡顿与反向拖动问题。
+        """
+        if not self._left_down:
+            self.left_down(pos)
+        self._post_mouse(self._Quartz.kCGEventLeftMouseDragged, pos, self._Quartz.kCGMouseButtonLeft, delta=(dx, dy))
+
     def move_cursor(self, pos: Point) -> None:
         """
         将系统光标移动到指定位置（通过 mouseMoved 事件，而不是 CGWarpMouseCursorPosition）。
         用途：在“视角触点到边界回中”时，先在抬起状态下把光标移回锚点，避免被 iPhone Mirroring
         误判为“按住状态下的反向拖动”。
         """
-        self._post_mouse(self._Quartz.kCGEventMouseMoved, pos, self._Quartz.kCGMouseButtonLeft)
+        # 这是“teleport”，不应携带跨位置的 delta（否则会污染某些消费端的相对运动基线）。
+        self._post_mouse(self._Quartz.kCGEventMouseMoved, pos, self._Quartz.kCGMouseButtonLeft, delta=(0, 0))
 
     def drag_smooth(self, start: Point, end: Point, *, max_step_px: float, step_delay_s: float = 0.0) -> None:
         if not self._left_down:

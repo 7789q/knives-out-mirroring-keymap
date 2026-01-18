@@ -72,6 +72,7 @@ class UIApp:
             self._log_path.parent.mkdir(parents=True, exist_ok=True)
             fh = RotatingFileHandler(
                 str(self._log_path),
+                mode="w",  # 每次启动清空旧日志，便于定位“本次启动”的问题
                 maxBytes=512 * 1024,
                 backupCount=3,
                 encoding="utf-8",
