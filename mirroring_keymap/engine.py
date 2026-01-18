@@ -141,6 +141,8 @@ class Engine:
         self._mouse_dy_acc: float = 0.0
         # 最近一次“真实鼠标移动事件”的时间戳（仅用于诊断/状态机）
         self._last_mouse_event_ts: float = 0.0
+        # 最近一次“真实鼠标移动事件”的光标位置（Quartz 全局坐标）
+        self._last_mouse_loc: Optional[Point] = None
         self._tap_queue: Deque[TapRequest] = deque()
         self._wheel = WheelSession()
         self._joy_session = JoystickSession()
@@ -149,6 +151,9 @@ class Engine:
         self._cam_recenter_pending: bool = False
         self._cam_recenter_pos: Optional[Point] = None
         self._cam_recenter_mouse_ts0: float = 0.0
+        # 回中流程分两步：先 release + warp 回锚点（会触发未打标 mouseMoved），再等待用户真实移动开始下一段。
+        # ready=False 时 _maybe_start_camera_after_recenter 不会启动（避免竞态：用户移动事件先到、warp 还未执行）。
+        self._cam_recenter_ready: bool = False
 
         # 键盘状态兜底：部分场景（例如系统安全输入）可能导致 EventTap 收不到键盘事件。
         # 这里通过轮询 CGEventSourceKeyState 做“WASD/热键/自定义按键”的备用输入源。
@@ -747,9 +752,17 @@ class Engine:
                                 dy = dy2
                         except Exception:
                             pass
+                loc = None
+                try:
+                    l = Quartz.CGEventGetLocation(event)
+                    loc = (float(l.x), float(l.y))
+                except Exception:
+                    loc = None
                 with self._lock:
-                    # 记录“真实鼠标”移动时间（用于回中状态机）
+                    # 记录“真实鼠标”移动时间与位置（用于回中状态机）
                     self._last_mouse_event_ts = now
+                    if loc is not None:
+                        self._last_mouse_loc = loc
                     # 回中待机：此时不采集轨迹（避免把回中的系统抖动/残余移动计入下一段拖动）
                     if self._cam_recenter_pending:
                         swallow = True
@@ -1321,20 +1334,25 @@ class Engine:
                     self._inj.left_up(target1)
                 except Exception:
                     pass
-                # 关键：在“未按下”状态下先把光标移回锚点，
-                # 避免 iPhone Mirroring/游戏端把下一次 mouseDown 视作一次跨位置的拖动/反向跳动。
-                try:
-                    self._inj.move_cursor((float(anchor[0]), float(anchor[1])))
-                except Exception:
-                    pass
                 with self._lock:
                     self._cam_session = CameraSession()  # 已抬起：结束本次按住
                     self._mouse_dx_acc = 0.0
                     self._mouse_dy_acc = 0.0
                     self._cam_recenter_pending = True
+                    self._cam_recenter_ready = False
                     # 回中目标严格使用锚点坐标（不随机），避免肉眼“回中偏移”
                     self._cam_recenter_pos = (float(anchor[0]), float(anchor[1]))
                     self._cam_recenter_mouse_ts0 = float(self._last_mouse_event_ts)
+                # 关键：使用 CGWarpMouseCursorPosition 把系统光标回到锚点（比 mouseMoved 更“硬”），
+                # 某些情况下 iPhone Mirroring 仅在光标真实位置改变后才会正确重置下一段拖动基线。
+                # 注意：warp 会触发未打标的 mouseMoved 事件，因此必须在 pending 状态下进行。
+                try:
+                    self._inj.warp((float(anchor[0]), float(anchor[1])))
+                except Exception:
+                    pass
+                with self._lock:
+                    if self._cam_recenter_pending:
+                        self._cam_recenter_ready = True
                 self._last_camera_ts = now
                 self._log.info("视角到达边界：已抬起，等待新轨迹后回中")
                 return
@@ -1360,37 +1378,51 @@ class Engine:
             pos = self._cam_recenter_pos
             ts0 = float(self._cam_recenter_mouse_ts0)
             last_ts = float(self._last_mouse_event_ts)
+            last_loc = self._last_mouse_loc
+            ready = bool(self._cam_recenter_ready)
 
         if (not pending) or (pos is None):
             return False
 
+        # 还在做“回中准备”（warp/同步）时不要启动，避免竞态导致依然反向。
+        if not ready:
+            return False
+
         # 还没有新的鼠标移动（保持待机，让摇杆等其他控件继续工作）
         if last_ts <= ts0:
+            return False
+        # warp 可能会触发一次“位置=锚点”的 mouseMoved；这不应视作用户新轨迹。
+        if last_loc is None:
+            return False
+        if math.hypot(float(last_loc[0]) - float(pos[0]), float(last_loc[1]) - float(pos[1])) < 0.5:
             return False
 
         # 单指限制：重新按下前释放摇杆（避免立刻被其它服务抢占）
         self._release_joystick_hold()
 
         try:
-            # 光标位置先回锚点（未按下），再 mouseDown，避免“边界→锚点”被误判成拖动。
-            try:
-                self._inj.move_cursor(pos)
-            except Exception:
-                pass
             self._inj.left_down(pos)
             # 给极小的按下窗口，让“按住拖动”更稳定
             time.sleep(0.003)
+            # 关键：用 0 位移 drag “锚定”新一段拖动起点，强制消费端把基线更新为锚点，
+            # 避免在快速甩动时仍把上一段末位置当作本段起点，导致反向跳动。
+            try:
+                self._inj.left_drag(pos)
+            except Exception:
+                pass
         except Exception as e:
             self._warn_throttled("camera_recenter_down_failed", now, "视角回中按下失败：%s", e)
             self._safe_release_all()
             with self._lock:
                 self._cam_recenter_pending = False
                 self._cam_recenter_pos = None
+                self._cam_recenter_ready = False
             return True
 
         with self._lock:
             self._cam_recenter_pending = False
             self._cam_recenter_pos = None
+            self._cam_recenter_ready = False
             self._mouse_dx_acc = 0.0
             self._mouse_dy_acc = 0.0
             self._cam_session.active = True
